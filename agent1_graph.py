@@ -180,6 +180,32 @@ def check_active_incidents(ticket: Dict[str, Any], db_path: str = DEFAULT_DB_PAT
     if not sku or not category:
         return None
 
+    try:
+        with connect_db(db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT incident_id, title, severity, created_at, report, affected_sku
+                FROM incidents
+                WHERE active = 1
+                  AND category = ?
+                  AND (affected_sku = ? OR affected_sku = 'MULTIPLE')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (category, sku),
+            ).fetchone()
+        if row:
+            return {
+                "incident_id": row["incident_id"],
+                "title": row["title"],
+                "severity": row["severity"],
+                "created_at": row["created_at"],
+                "affected_sku": row["affected_sku"],
+                "reason": row["report"],
+            }
+    except sqlite3.Error:
+        pass
+
     with connect_db(db_path) as conn:
         row = conn.execute(
             """

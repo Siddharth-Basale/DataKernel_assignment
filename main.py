@@ -263,6 +263,17 @@ class AgentRunResponse(BaseModel):
     agent_state: Dict[str, Any] = Field(..., description="Final LangGraph Agent 1 state.")
 
 
+class Agent2RunResponse(BaseModel):
+    incidents: List[Dict[str, Any]] = Field(..., description="Incidents created or refreshed by Agent 2.")
+    agent_steps: List[str] = Field(..., description="Agent 2 progress log.")
+    candidate_count: int = Field(..., description="Number of anomaly candidates selected for investigation.")
+
+
+class IncidentListResponse(BaseModel):
+    total: int = Field(..., description="Number of incidents returned.")
+    items: List[Dict[str, Any]] = Field(..., description="Persisted incidents from SQLite.")
+
+
 class CountItem(BaseModel):
     name: str = Field(..., description="Group name.")
     count: int = Field(..., description="Number of matching tickets.")
@@ -278,8 +289,8 @@ class InsightsResponse(BaseModel):
 
 
 app = FastAPI(
-    title="Customer Support Insight Platform - Agent 1",
-    version="1.1.0",
+    title="Customer Support Insight Platform - Agent 1 + Agent 2",
+    version="1.2.0",
     description=(
         "Local FastAPI backend for AI-powered customer support triage. "
         "Use `/tickets/draft` to enrich a minimal customer complaint, review the generated fields, "
@@ -290,6 +301,7 @@ app = FastAPI(
         {"name": "System", "description": "Health checks and dataset seeding."},
         {"name": "Tickets", "description": "Ticket listing, drafting, submission, and lookup."},
         {"name": "Agent 1", "description": "LangGraph ticket resolution agent: suggest reply, auto-resolve, or escalate."},
+        {"name": "Agent 2", "description": "LangGraph anomaly investigation agent: detect spikes, create incidents, and flag SKUs."},
         {"name": "Insights", "description": "Dashboard-style aggregate metrics from SQLite."},
     ],
 )
@@ -319,6 +331,41 @@ def init_db() -> None:
     columns.extend([f"{column} TEXT" for column in EXTRA_COLUMNS])
     with connect_db() as conn:
         conn.execute(f"CREATE TABLE IF NOT EXISTS tickets ({', '.join(columns)})")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS incidents (
+                incident_id TEXT PRIMARY KEY,
+                title TEXT,
+                severity TEXT,
+                category TEXT,
+                affected_sku TEXT,
+                start_date TEXT,
+                end_date TEXT,
+                z_score REAL,
+                ticket_count INTEGER,
+                top_skus TEXT,
+                pattern TEXT,
+                root_cause TEXT,
+                recommended_action TEXT,
+                sample_ticket_ids TEXT,
+                report TEXT,
+                active INTEGER DEFAULT 1,
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sku_incident_flags (
+                product_sku TEXT PRIMARY KEY,
+                incident_id TEXT,
+                category TEXT,
+                severity TEXT,
+                active_incident INTEGER DEFAULT 1,
+                updated_at TEXT
+            )
+            """
+        )
         conn.commit()
 
 
@@ -415,6 +462,19 @@ def draft_ticket(raw_ticket: Dict[str, Any]) -> Dict[str, Any]:
     return draft_ticket_fields(raw_ticket, DB_PATH)
 
 
+def run_agent2(
+    threshold: float,
+    max_incidents: int,
+    start_date: str,
+    end_date: str,
+) -> Dict[str, Any]:
+    try:
+        from agent2_graph import run_agent2_investigation
+    except Exception as exc:
+        raise RuntimeError("Agent 2 dependencies are missing. Run: pip install -r requirements.txt") from exc
+    return run_agent2_investigation(DB_PATH, threshold, max_incidents, start_date, end_date)
+
+
 def build_submit_payload(draft: Dict[str, Any]) -> Dict[str, Any]:
     submit_fields = [
         "ticket_id",
@@ -447,6 +507,20 @@ def build_submit_payload(draft: Dict[str, Any]) -> Dict[str, Any]:
         "embedding_id",
     ]
     return {field: draft[field] for field in submit_fields if field in draft and draft[field] is not None}
+
+
+def decode_incident_row(row: sqlite3.Row) -> Dict[str, Any]:
+    data = row_to_dict(row)
+    for field in ["top_skus", "sample_ticket_ids"]:
+        if data.get(field):
+            try:
+                data[field] = json.loads(data[field])
+            except json.JSONDecodeError:
+                data[field] = []
+        else:
+            data[field] = []
+    data["active"] = bool(data.get("active"))
+    return data
 
 
 @app.on_event("startup")
@@ -720,6 +794,63 @@ def run_agent1(ticket_id: str) -> Dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return {"ticket_id": ticket_id, "agent_state": final_state}
+
+
+@app.post(
+    "/agent2/run",
+    response_model=Agent2RunResponse,
+    tags=["Agent 2"],
+    summary="Run Agent 2 anomaly investigation",
+    description=(
+        "Runs the Day-9 anomaly investigation flow from the implementation plan. "
+        "It scans historical category volumes, computes 7-day rolling z-scores, investigates the plan's three known spike windows, "
+        "writes incidents to SQLite, and flags affected SKUs for Agent 1."
+    ),
+)
+def run_agent2_endpoint(
+    threshold: Annotated[float, Query(description="Z-score threshold for selecting anomaly windows.")] = 2.0,
+    max_incidents: Annotated[int, Query(ge=1, le=10, description="Maximum incidents to create in one run.")] = 3,
+    start_date: Annotated[str, Query(description="Start date for historical scan, YYYY-MM-DD.")] = "2024-07-01",
+    end_date: Annotated[str, Query(description="End date for historical scan, YYYY-MM-DD.")] = "2025-01-31",
+) -> Dict[str, Any]:
+    init_db()
+    try:
+        state = run_agent2(threshold, max_incidents, start_date, end_date)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {
+        "incidents": state.get("incidents", []),
+        "agent_steps": state.get("agent_steps", []),
+        "candidate_count": len(state.get("candidates", [])),
+    }
+
+
+@app.get(
+    "/agent2/incidents",
+    response_model=IncidentListResponse,
+    tags=["Agent 2"],
+    summary="List persisted Agent 2 incidents",
+    description="Returns incidents written by Agent 2. Agent 1 reads these active incidents during escalation checks.",
+)
+def list_agent2_incidents(
+    active_only: Annotated[bool, Query(description="If true, return only active incidents.")] = True,
+    limit: Annotated[int, Query(ge=1, le=100, description="Maximum incidents to return.")] = 20,
+) -> Dict[str, Any]:
+    init_db()
+    where_sql = "WHERE active = 1" if active_only else ""
+    with connect_db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM incidents
+            {where_sql}
+            ORDER BY created_at DESC, severity DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    items = [decode_incident_row(row) for row in rows]
+    return {"total": len(items), "items": items}
 
 
 @app.get(
