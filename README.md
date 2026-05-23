@@ -1,6 +1,6 @@
 # Customer Support Insight Platform Documentation
 
-This project implements a local AI-powered customer support backend for the assignment dataset. The work completed here covers the FastAPI backend, SQLite storage, Chroma vector search, LangGraph Agent 1, LangGraph Agent 2, and LangGraph Agent 3.
+This project implements a local AI-powered customer support platform for the assignment dataset. It includes a FastAPI backend, a React dashboard, SQLite storage, Chroma vector search, and three LangGraph agents.
 
 ## What Was Built
 
@@ -15,6 +15,49 @@ This project implements a local AI-powered customer support backend for the assi
   - `agent2_graph.png`
   - `agent3_graph.png`
 - OpenAPI/Swagger documentation with detailed schemas and examples.
+- A React dashboard in `frontend/` (Vite + TypeScript + Tailwind).
+
+## Quick start (backend + frontend)
+
+### Backend
+
+```bash
+pip install -r requirements.txt
+# Set OPENAI_API_KEY in .env for full AI/RAG/agent runs
+uvicorn main:app --reload --port 8000
+```
+
+### Frontend
+
+```bash
+cd frontend
+cp .env.example .env
+npm install
+npm run dev
+```
+
+Open [http://localhost:5173](http://localhost:5173). The UI calls the API at `http://127.0.0.1:8000` by default (`VITE_API_BASE_URL`).
+
+### First-run demo flow
+
+1. Go to **Setup** and run **POST /seed** (optionally cap vectors with the slider).
+2. Open **Dashboard** for KPIs, charts, and sentiment trends.
+3. Use **New ticket** with demo presets (escalation / RAG / auto-resolve).
+4. Run **Agent 2** on **Incidents**, then submit a Samsung S24 ticket to see cross-agent escalation.
+5. Run **Agent 3** on **Retention** for the churn queue.
+
+## Frontend routes
+
+| Route | Purpose |
+|-------|---------|
+| `/` | Executive dashboard — top issues, sentiment trends, revenue at risk |
+| `/tickets` | Ticket queue with search and filters |
+| `/tickets/new` | Draft → review → submit wizard with RAG examples |
+| `/tickets/:id` | Ticket detail, agent trace, customer history, SKU incident banner |
+| `/incidents` | Agent 2 incidents and flagged SKUs |
+| `/retention` | Agent 3 retention queue |
+| `/agents` | Agent overview and LangGraph diagrams |
+| `/setup` | Seed database and Chroma vectors |
 
 ## Data Flow
 
@@ -386,6 +429,30 @@ Returns:
 ### `GET /insights`
 
 Returns dashboard-style aggregate metrics.
+
+### `GET /insights/trends`
+
+Returns weekly or daily sentiment and volume trends for charts.
+
+### `GET /customers/{customer_id}/tickets`
+
+Returns recent tickets for one customer (history panel).
+
+### `GET /tickets/search`
+
+Search by ticket ID, customer name, message, or SKU.
+
+### `GET /tickets/filters`
+
+Distinct values for category, status, tier, frustration, and channel filters.
+
+### `GET /agent2/sku-flags`
+
+Lists SKUs flagged by Agent 2 (read by Agent 1 on new tickets).
+
+### `GET /system/setup`
+
+Returns seed/vector/OpenAI status for the setup page.
 
 Includes:
 

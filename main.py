@@ -9,8 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional, Union
 
+from collections import defaultdict
+
 from dotenv import load_dotenv
 from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -301,9 +304,18 @@ class InsightsResponse(BaseModel):
     sentiment_by_category: List[Dict[str, Any]] = Field(..., description="Per-category sentiment and revenue-at-risk aggregates.")
 
 
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+]
+
 app = FastAPI(
     title="Customer Support Insight Platform - Agent 1 + Agent 2 + Agent 3",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "Local FastAPI backend for AI-powered customer support triage. "
         "Use `/tickets/draft` to enrich a minimal customer complaint, review the generated fields, "
@@ -318,6 +330,14 @@ app = FastAPI(
         {"name": "Agent 3", "description": "LangGraph customer risk agent: score churn risk and draft retention offers."},
         {"name": "Insights", "description": "Dashboard-style aggregate metrics from SQLite."},
     ],
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -658,6 +678,8 @@ def list_tickets(
     offset: Annotated[int, Query(ge=0, description="Number of matching tickets to skip.")] = 0,
     category: Annotated[Optional[str], Query(description="Optional top-level category filter, such as delivery.")] = None,
     status: Annotated[Optional[str], Query(description="Optional resolution status filter: pending, resolved, unresolved, escalated.")] = None,
+    frustration: Annotated[Optional[str], Query(description="Optional frustration_level filter.")] = None,
+    agent_decision: Annotated[Optional[str], Query(description="Optional agent_decision filter.")] = None,
 ) -> Dict[str, Any]:
     init_db()
     where = []
@@ -668,6 +690,12 @@ def list_tickets(
     if status:
         where.append("resolution_status = ?")
         params.append(status)
+    if frustration:
+        where.append("frustration_level = ?")
+        params.append(frustration)
+    if agent_decision:
+        where.append("agent_decision = ?")
+        params.append(agent_decision)
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     with connect_db() as conn:
         rows = conn.execute(
@@ -682,6 +710,58 @@ def list_tickets(
         ).fetchall()
         total = conn.execute(f"SELECT COUNT(*) AS count FROM tickets {where_sql}", params).fetchone()["count"]
     return {"total": total, "limit": limit, "offset": offset, "items": [row_to_dict(row) for row in rows]}
+
+
+@app.get(
+    "/tickets/filters",
+    tags=["Tickets"],
+    summary="Distinct filter values for ticket lists",
+)
+def ticket_filters() -> Dict[str, Any]:
+    init_db()
+    columns = ["category", "resolution_status", "customer_tier", "frustration_level", "channel", "agent_decision"]
+    result: Dict[str, List[str]] = {}
+    with connect_db() as conn:
+        for column in columns:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT {column} AS value
+                FROM tickets
+                WHERE {column} IS NOT NULL AND TRIM({column}) != ''
+                ORDER BY value
+                """
+            ).fetchall()
+            result[column] = [row["value"] for row in rows]
+    return result
+
+
+@app.get(
+    "/tickets/search",
+    tags=["Tickets"],
+    summary="Search tickets by id, customer, or message",
+)
+def search_tickets(
+    q: Annotated[str, Query(min_length=1, description="Search text.")],
+    limit: Annotated[int, Query(ge=1, le=50)] = 20,
+) -> Dict[str, Any]:
+    init_db()
+    pattern = f"%{q.strip()}%"
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM tickets
+            WHERE ticket_id LIKE ?
+               OR customer_name LIKE ?
+               OR message LIKE ?
+               OR product_sku LIKE ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (pattern, pattern, pattern, pattern, limit),
+        ).fetchall()
+    items = [row_to_dict(row) for row in rows]
+    return {"query": q, "total": len(items), "items": items}
 
 
 @app.post(
@@ -1013,6 +1093,160 @@ def insights() -> Dict[str, Any]:
         "language_distribution": aggregate_counts("language", 10),
         "status_distribution": aggregate_counts("resolution_status", 10),
         "sentiment_by_category": [row_to_dict(row) for row in by_category],
+    }
+
+
+@app.get(
+    "/insights/trends",
+    tags=["Insights"],
+    summary="Get sentiment and volume trends over time",
+)
+def insights_trends(
+    granularity: Annotated[str, Query(description="day or week aggregation.")] = "week",
+    start_date: Annotated[Optional[str], Query(description="Start date YYYY-MM-DD.")] = None,
+    end_date: Annotated[Optional[str], Query(description="End date YYYY-MM-DD.")] = None,
+) -> Dict[str, Any]:
+    init_db()
+    with connect_db() as conn:
+        bounds = conn.execute(
+            """
+            SELECT MIN(substr(timestamp, 1, 10)) AS min_date,
+                   MAX(substr(timestamp, 1, 10)) AS max_date
+            FROM tickets
+            """
+        ).fetchone()
+        start = start_date or bounds["min_date"] or "2024-07-01"
+        end = end_date or bounds["max_date"] or "2025-01-31"
+        rows = conn.execute(
+            """
+            SELECT substr(timestamp, 1, 10) AS day,
+                   AVG(CAST(sentiment_score AS REAL)) AS avg_sentiment,
+                   COUNT(*) AS ticket_count,
+                   COALESCE(SUM(CAST(revenue_at_risk AS REAL)), 0) AS revenue_at_risk
+            FROM tickets
+            WHERE substr(timestamp, 1, 10) BETWEEN ? AND ?
+            GROUP BY day
+            ORDER BY day
+            """,
+            (start, end),
+        ).fetchall()
+
+    daily = [row_to_dict(row) for row in rows]
+    if granularity != "week":
+        return {"granularity": "day", "start_date": start, "end_date": end, "points": daily}
+
+    weekly: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {"avg_sentiment_sum": 0.0, "ticket_count": 0, "revenue_at_risk": 0.0, "days": 0}
+    )
+    for point in daily:
+        day = point["day"]
+        week_key = day[:7] + "-W" + str(datetime.strptime(day, "%Y-%m-%d").isocalendar()[1]).zfill(2)
+        bucket = weekly[week_key]
+        bucket["period"] = week_key
+        bucket["avg_sentiment_sum"] += float(point["avg_sentiment"] or 0) * int(point["ticket_count"])
+        bucket["ticket_count"] += int(point["ticket_count"])
+        bucket["revenue_at_risk"] += float(point["revenue_at_risk"] or 0)
+        bucket["days"] += 1
+
+    points = []
+    for key in sorted(weekly.keys()):
+        bucket = weekly[key]
+        count = bucket["ticket_count"] or 1
+        points.append(
+            {
+                "period": key,
+                "avg_sentiment": round(bucket["avg_sentiment_sum"] / count, 4),
+                "ticket_count": bucket["ticket_count"],
+                "revenue_at_risk": round(bucket["revenue_at_risk"], 2),
+            }
+        )
+    return {"granularity": "week", "start_date": start, "end_date": end, "points": points}
+
+
+@app.get(
+    "/customers/{customer_id}/tickets",
+    tags=["Tickets"],
+    summary="List tickets for a customer",
+)
+def customer_tickets(
+    customer_id: str,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> Dict[str, Any]:
+    init_db()
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM tickets
+            WHERE customer_id = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (customer_id, limit),
+        ).fetchall()
+    items = [row_to_dict(row) for row in rows]
+    return {"customer_id": customer_id, "total": len(items), "items": items}
+
+
+@app.get(
+    "/agent2/sku-flags",
+    tags=["Agent 2"],
+    summary="List SKU incident flags from Agent 2",
+)
+def list_sku_flags(
+    active_only: Annotated[bool, Query(description="Return only active SKU flags.")] = True,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> Dict[str, Any]:
+    init_db()
+    where_sql = "WHERE active_incident = 1" if active_only else ""
+    with connect_db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT product_sku, incident_id, category, severity, active_incident, updated_at
+            FROM sku_incident_flags
+            {where_sql}
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    items = [row_to_dict(row) for row in rows]
+    for item in items:
+        item["active_incident"] = bool(item.get("active_incident"))
+    return {"total": len(items), "items": items}
+
+
+@app.get(
+    "/system/setup",
+    tags=["System"],
+    summary="First-run setup status for the UI",
+)
+def system_setup() -> Dict[str, Any]:
+    init_db()
+    vectors_ready = False
+    vector_count = 0
+    try:
+        from agent1_graph import get_chroma_collection
+
+        collection = get_chroma_collection()
+        vector_count = collection.count()
+        vectors_ready = vector_count > 0
+    except Exception:
+        vectors_ready = False
+
+    with connect_db() as conn:
+        ticket_count = conn.execute("SELECT COUNT(*) AS count FROM tickets").fetchone()["count"]
+        incident_count = conn.execute("SELECT COUNT(*) AS count FROM incidents").fetchone()["count"]
+
+    return {
+        "seeded": ticket_count > 0,
+        "ticket_count": ticket_count,
+        "incident_count": incident_count,
+        "vectors_ready": vectors_ready,
+        "vector_count": vector_count,
+        "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
+        "database": DB_PATH,
+        "dataset_exists": Path(DATASET_PATH).exists(),
     }
 
 

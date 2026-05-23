@@ -1,6 +1,5 @@
-# Imports
-# Load standard libraries, local environment, LangGraph, LangChain OpenAI helpers,
-# and optional Chroma support used by the retrieval tools.
+
+
 import json
 import os
 import re
@@ -27,98 +26,143 @@ except ImportError:
 
 load_dotenv()
 
-DEFAULT_DB_PATH = "support.db"
-CHROMA_PATH = "chroma_store"
-COLLECTION_NAME = "resolved_ticket_replies"
-EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-CHAT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+DEFAULT_DB_PATH    = "support.db"
+CHROMA_PATH        = "chroma_store"
+COLLECTION_NAME    = "resolved_ticket_replies"
+CHROMA_DISTANCE    = "cosine"
+EMBEDDING_MODEL    = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+CHAT_MODEL         = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-CATEGORY_SUBCATEGORIES = {
-    "account_access": ["account_hacked", "address_not_updating", "cant_login", "order_history_missing", "two_factor_issue"],
-    "delivery": [
-        "delayed_delivery",
-        "delivery_attempted_not_home",
-        "not_delivered",
-        "package_stolen",
-        "partial_order_delivered",
-        "tracking_not_updating",
-        "wrong_address_delivered",
-    ],
-    "fake_counterfeit": ["brand_complaint", "fake_product", "listing_mismatch", "seller_fraud"],
-    "payment_billing": ["coupon_not_applied", "double_charged", "emi_not_applied", "invoice_incorrect", "payment_deducted_order_failed"],
-    "prime_subscription": ["charged_after_cancellation", "free_delivery_not_applied", "prime_benefits_not_showing", "video_not_accessible"],
-    "product_quality": [
-        "counterfeit_suspected",
-        "damaged_in_transit",
-        "dead_on_arrival",
-        "missing_parts",
-        "quality_not_as_described",
-        "wrong_item_sent",
-    ],
-    "refund_return": [
-        "exchange_not_processed",
-        "partial_refund",
-        "refund_not_received",
-        "refund_to_wrong_account",
-        "return_pickup_not_scheduled",
-        "return_rejected",
-    ],
+# ── Taxonomy ──────────────────────────────────────────────────────────────────
+CATEGORY_SUBCATEGORIES: Dict[str, List[str]] = {
+    "account_access":    ["account_hacked", "address_not_updating", "cant_login",
+                          "order_history_missing", "two_factor_issue"],
+    "delivery":          ["delayed_delivery", "delivery_attempted_not_home", "not_delivered",
+                          "package_stolen", "partial_order_delivered",
+                          "tracking_not_updating", "wrong_address_delivered"],
+    "fake_counterfeit":  ["brand_complaint", "fake_product", "listing_mismatch", "seller_fraud"],
+    "payment_billing":   ["coupon_not_applied", "double_charged", "emi_not_applied",
+                          "invoice_incorrect", "payment_deducted_order_failed"],
+    "prime_subscription":["charged_after_cancellation", "free_delivery_not_applied",
+                          "prime_benefits_not_showing", "video_not_accessible"],
+    "product_quality":   ["counterfeit_suspected", "damaged_in_transit", "dead_on_arrival",
+                          "missing_parts", "quality_not_as_described", "wrong_item_sent"],
+    "refund_return":     ["exchange_not_processed", "partial_refund", "refund_not_received",
+                          "refund_to_wrong_account", "return_pickup_not_scheduled",
+                          "return_rejected"],
 }
+
+# Categories that must always escalate regardless of priority score
+# (legal risk, security breach, brand fraud — never auto-reply)
+ALWAYS_ESCALATE_CATEGORIES = {"fake_counterfeit"}
+ALWAYS_ESCALATE_SUBCATEGORIES = {"account_hacked"}
+
+# Simple issues the agent can resolve itself without RAG
+AUTO_RESOLVE_SUBCATEGORIES = {"cant_login", "two_factor_issue", "prime_benefits_not_showing",
+                               "video_not_accessible", "address_not_updating"}
 
 BASE_SENTIMENTS = {
-    "delivery": -0.55,
-    "refund_return": -0.65,
-    "product_quality": -0.60,
-    "payment_billing": -0.70,
-    "account_access": -0.50,
-    "fake_counterfeit": -0.85,
-    "prime_subscription": -0.45,
+    "delivery": -0.55, "refund_return": -0.65, "product_quality": -0.60,
+    "payment_billing": -0.70, "account_access": -0.50,
+    "fake_counterfeit": -0.85, "prime_subscription": -0.45,
 }
-
 BASE_URGENCY = {
-    "delivery": 0.55,
-    "refund_return": 0.65,
-    "product_quality": 0.60,
-    "payment_billing": 0.80,
-    "account_access": 0.70,
-    "fake_counterfeit": 0.85,
-    "prime_subscription": 0.40,
+    "delivery": 0.55, "refund_return": 0.65, "product_quality": 0.60,
+    "payment_billing": 0.80, "account_access": 0.70,
+    "fake_counterfeit": 0.85, "prime_subscription": 0.40,
+}
+
+# Auto-resolve reply templates (no LLM tokens needed for these)
+AUTO_RESOLVE_REPLIES: Dict[str, str] = {
+    "cant_login": (
+        "Hi {name}, I understand you're unable to log in. Please tap 'Forgot Password' and enter "
+        "your registered email. An OTP will arrive within 3 minutes. If it doesn't, check your spam "
+        "folder or reply here and we'll escalate to account recovery immediately."
+    ),
+    "two_factor_issue": (
+        "Hi {name}, if you've lost access to your 2FA device, please go to Account Settings → "
+        "Security → 'Can't access your authenticator?' and follow the recovery steps. "
+        "If you're still blocked, reply with your registered email and we'll escalate to our "
+        "account security team."
+    ),
+    "prime_benefits_not_showing": (
+        "Hi {name}, Prime benefits sometimes take up to 2 hours to reflect after renewal. "
+        "Please sign out, clear your app cache, and sign back in. If delivery charges still show "
+        "for Prime-eligible items, reply here and we'll credit the delivery charge back immediately."
+    ),
+    "video_not_accessible": (
+        "Hi {name}, Prime Video access issues are usually resolved by signing out and back in on "
+        "your device. If a specific title shows 'not available', it may have geographic restrictions. "
+        "For billing or subscription issues with Video, reply here and we'll escalate to our "
+        "Prime team."
+    ),
+    "address_not_updating": (
+        "Hi {name}, please try adding your new address from a desktop browser at amazon.in/address "
+        "and set it as default there — the mobile app occasionally has a sync delay. "
+        "If the issue persists after 30 minutes, reply here with your new address and we'll update "
+        "it directly on our end."
+    ),
 }
 
 
-# State definition (TypedDict/Pydantic)
-# This state is passed through every LangGraph node so the intermediate reasoning
-# remains visible and easy to debug.
+# ═════════════════════════════════════════════════════════════════════════════
+# State
+# ═════════════════════════════════════════════════════════════════════════════
+
 class Agent1State(TypedDict, total=False):
-    ticket_id: str
-    db_path: str
-    ticket: Dict[str, Any]
+    ticket_id:        str
+    db_path:          str
+    ticket:           Dict[str, Any]
     customer_history: List[Dict[str, Any]]
-    order_details: Dict[str, Any]
-    active_incident: Optional[Dict[str, Any]]
-    priority_score: float
-    frustration_level: str
-    auto_escalate: bool
-    similar_tickets: List[Dict[str, Any]]
-    suggested_reply: str
-    key_entities: List[str]
-    decision: str
-    reason: str
-    agent_steps: List[str]
-    error: str
+    order_details:    Dict[str, Any]
+    active_incident:  Optional[Dict[str, Any]]
+    priority_score:   float
+    frustration_level:str
+    auto_escalate:    bool
+    auto_resolve_now: bool          # NEW: early-route flag for simple issues
+    similar_tickets:  List[Dict[str, Any]]
+    suggested_reply:  str
+    key_entities:     List[str]
+    decision:         str
+    reason:           str
+    agent_steps:      List[str]     # always a Python list; serialised on DB write
+    classification_confidence: float  # NEW: LLM classification confidence 0-1
+    error:            str
 
 
-# Tool functions
-# These functions do the real work: read/write SQLite, search Chroma, call OpenAI,
-# and calculate routing decisions from ticket fields.
+# ═════════════════════════════════════════════════════════════════════════════
+# Helpers — DB
+# ═════════════════════════════════════════════════════════════════════════════
+
 def connect_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def _safe_load_json_list(value: Any) -> List[Any]:
+    """
+    FIX P6: Deserialise a value that was stored as a JSON string back to a
+    Python list. Never raises — returns [] on any failure.
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except (json.JSONDecodeError, ValueError):
+            return []
+    return []
+
+
 def row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
-    return {key: row[key] for key in row.keys()}
+    d = {key: row[key] for key in row.keys()}
+    # P6: auto-deserialise list columns when reading back from SQLite
+    for col in ("agent_steps", "key_entities", "rag_examples", "similar_tickets"):
+        if col in d and isinstance(d[col], str):
+            d[col] = _safe_load_json_list(d[col])
+    return d
 
 
 def fetch_ticket(ticket_id: str, db_path: str = DEFAULT_DB_PATH) -> Dict[str, Any]:
@@ -129,21 +173,80 @@ def fetch_ticket(ticket_id: str, db_path: str = DEFAULT_DB_PATH) -> Dict[str, An
     return row_to_dict(row)
 
 
-def update_ticket_fields(ticket_id: str, updates: Dict[str, Any], db_path: str = DEFAULT_DB_PATH) -> None:
+def update_ticket_fields(
+    ticket_id: str,
+    updates: Dict[str, Any],
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    """
+    FIX P6: Serialise list/dict values to JSON before writing; they are
+    deserialised automatically by row_to_dict when read back.
+    """
     if not updates:
         return
-    assignments = ", ".join(f"{key} = ?" for key in updates)
-    values = [json.dumps(value) if isinstance(value, (list, dict)) else value for value in updates.values()]
+    serialised = {
+        k: json.dumps(v) if isinstance(v, (list, dict)) else v
+        for k, v in updates.items()
+    }
+    assignments = ", ".join(f"{k} = ?" for k in serialised)
+    values = list(serialised.values())
+    values.append(datetime.utcnow().isoformat(timespec="seconds"))
     values.append(ticket_id)
     with connect_db(db_path) as conn:
         conn.execute(
             f"UPDATE tickets SET {assignments}, updated_at = ? WHERE ticket_id = ?",
-            [*values[:-1], datetime.utcnow().isoformat(timespec="seconds"), values[-1]],
+            values,
         )
         conn.commit()
 
 
-def get_customer_history(customer_id: str, ticket_id: str, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+# ═════════════════════════════════════════════════════════════════════════════
+# Helpers — AI clients
+# ═════════════════════════════════════════════════════════════════════════════
+
+def get_chat_model() -> Any:
+    if ChatOpenAI is None:
+        raise RuntimeError("langchain-openai not installed.")
+    return ChatOpenAI(model=CHAT_MODEL, temperature=0.2)
+
+
+def get_embeddings_model() -> Any:
+    if OpenAIEmbeddings is None:
+        raise RuntimeError("langchain-openai not installed.")
+    return OpenAIEmbeddings(model=EMBEDDING_MODEL)
+
+
+def get_chroma_collection() -> Any:
+    if chromadb is None:
+        raise RuntimeError("chromadb not installed.")
+    Path(CHROMA_PATH).mkdir(exist_ok=True)
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    return client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": CHROMA_DISTANCE},
+    )
+
+
+def distances_to_similarity_percent(distances: List[float]) -> List[int]:
+    if not distances:
+        return []
+    if all(0.0 <= d <= 2.0 for d in distances):
+        return [max(0, min(100, round((1.0 - d) * 100))) for d in distances]
+    mn, mx = min(distances), max(distances)
+    if mx <= mn:
+        return [100] * len(distances)
+    return [max(0, min(100, round(100.0 * (1.0 - (d - mn) / (mx - mn))))) for d in distances]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Tool: get_customer_history
+# ═════════════════════════════════════════════════════════════════════════════
+
+def get_customer_history(
+    customer_id: str,
+    ticket_id: str,
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[Dict[str, Any]]:
     with connect_db(db_path) as conn:
         rows = conn.execute(
             """
@@ -158,6 +261,10 @@ def get_customer_history(customer_id: str, ticket_id: str, db_path: str = DEFAUL
         ).fetchall()
     return [row_to_dict(row) for row in rows]
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Tool: get_order_details
+# ═════════════════════════════════════════════════════════════════════════════
 
 def get_order_details(order_id: str, db_path: str = DEFAULT_DB_PATH) -> Dict[str, Any]:
     with connect_db(db_path) as conn:
@@ -174,8 +281,18 @@ def get_order_details(order_id: str, db_path: str = DEFAULT_DB_PATH) -> Dict[str
     return row_to_dict(row) if row else {}
 
 
-def check_active_incidents(ticket: Dict[str, Any], db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
-    sku = ticket.get("product_sku")
+# ═════════════════════════════════════════════════════════════════════════════
+# Tool: check_active_incidents
+# FIX P3 — reads ONLY from the incidents table written by Agent 2.
+#           No hardcoded SKUs. No fallback heuristic. If Agent 2 hasn't run,
+#           this returns None and the ticket routes normally.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def check_active_incidents(
+    ticket: Dict[str, Any],
+    db_path: str = DEFAULT_DB_PATH,
+) -> Optional[Dict[str, Any]]:
+    sku      = ticket.get("product_sku")
     category = ticket.get("category")
     if not sku or not category:
         return None
@@ -196,334 +313,200 @@ def check_active_incidents(ticket: Dict[str, Any], db_path: str = DEFAULT_DB_PAT
             ).fetchone()
         if row:
             return {
-                "incident_id": row["incident_id"],
-                "title": row["title"],
-                "severity": row["severity"],
-                "created_at": row["created_at"],
-                "affected_sku": row["affected_sku"],
-                "reason": row["report"],
+                "incident_id":   row["incident_id"],
+                "title":         row["title"],
+                "severity":      row["severity"],
+                "created_at":    row["created_at"],
+                "affected_sku":  row["affected_sku"],
+                "reason":        row["report"],
             }
-    except sqlite3.Error:
+    except sqlite3.OperationalError:
+        # incidents table doesn't exist yet — Agent 2 hasn't run. That's fine.
         pass
 
-    with connect_db(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT COUNT(*) AS issue_count,
-                   COALESCE(SUM(CAST(order_value AS REAL)), 0) AS exposed_value,
-                   MAX(timestamp) AS last_seen
-            FROM tickets
-            WHERE product_sku = ?
-              AND category = ?
-              AND resolution_status IN ('unresolved', 'escalated', 'pending')
-            """,
-            (sku, category),
-        ).fetchone()
-
-    issue_count = int(row["issue_count"] or 0)
-    exposed_value = float(row["exposed_value"] or 0)
-    if sku == "SAMSUNG-S24" and category == "delivery":
-        return {
-            "title": "Samsung S24 delivery spike",
-            "severity": "high",
-            "created_at": row["last_seen"],
-            "reason": "Known dataset spike for Samsung S24 delivery complaints.",
-        }
-    if issue_count >= 25 and exposed_value >= 500000:
-        return {
-            "title": f"Possible active incident for {sku}",
-            "severity": "medium",
-            "created_at": row["last_seen"],
-            "reason": f"{issue_count} open or escalated {category} tickets expose {exposed_value:.2f} order value.",
-        }
     return None
 
 
-def calculate_priority(ticket: Dict[str, Any], history: List[Dict[str, Any]], incident: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    sentiment = abs(float(ticket.get("sentiment_score") or 0))
-    order_value = float(ticket.get("order_value") or 0)
-    tier = ticket.get("customer_tier") or "regular"
-    status = ticket.get("resolution_status") or "pending"
-    repeat_contact = str(ticket.get("is_repeat_contact")).lower() == "true"
-    unresolved_history = sum(1 for item in history if item.get("resolution_status") in {"unresolved", "escalated", "pending"})
+# ═════════════════════════════════════════════════════════════════════════════
+# Tool: calculate_priority
+# ═════════════════════════════════════════════════════════════════════════════
 
-    tier_bonus = {"regular": 0.0, "prime": 0.08, "prime_plus": 0.15}.get(tier, 0.0)
-    value_bonus = min(order_value / 200000, 0.35)
-    repeat_bonus = 0.12 if repeat_contact else 0.0
-    status_bonus = 0.12 if status in {"unresolved", "escalated", "pending"} else 0.0
-    history_bonus = min(unresolved_history * 0.04, 0.16)
+def calculate_priority(
+    ticket:   Dict[str, Any],
+    history:  List[Dict[str, Any]],
+    incident: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    sentiment        = abs(float(ticket.get("sentiment_score") or 0))
+    order_value      = float(ticket.get("order_value") or 0)
+    tier             = ticket.get("customer_tier") or "regular"
+    status           = ticket.get("resolution_status") or "pending"
+    repeat_contact   = str(ticket.get("is_repeat_contact")).lower() == "true"
+    unresolved_hist  = sum(
+        1 for t in history
+        if t.get("resolution_status") in {"unresolved", "escalated", "pending"}
+    )
+
+    tier_bonus     = {"regular": 0.0, "prime": 0.08, "prime_plus": 0.15}.get(tier, 0.0)
+    value_bonus    = min(order_value / 200_000, 0.35)
+    repeat_bonus   = 0.12 if repeat_contact else 0.0
+    status_bonus   = 0.12 if status in {"unresolved", "escalated", "pending"} else 0.0
+    history_bonus  = min(unresolved_hist * 0.04, 0.16)
     incident_bonus = 0.25 if incident else 0.0
 
-    priority_score = min(1.0, sentiment + tier_bonus + value_bonus + repeat_bonus + status_bonus + history_bonus + incident_bonus)
+    priority_score = min(1.0, sentiment + tier_bonus + value_bonus + repeat_bonus
+                         + status_bonus + history_bonus + incident_bonus)
+
     auto_escalate = bool(
-        incident
-        or (priority_score > 0.85 and tier == "prime_plus")
-        or (order_value > 50000 and ticket.get("frustration_level") == "critical" and status != "resolved")
+        incident                                                      # Agent 2 flagged this SKU
+        or (priority_score > 0.85 and tier == "prime_plus")          # VIP + critical priority
+        or (order_value > 100_000 and tier in {"prime", "prime_plus"})  # high-value VIP order
+        or (order_value > 50_000
+            and ticket.get("frustration_level") == "critical"
+            and status != "resolved")                                 # large frustrated order
     )
+
     return {
-        "priority_score": round(priority_score, 3),
+        "priority_score":   round(priority_score, 3),
         "frustration_level": ticket.get("frustration_level") or "medium",
-        "auto_escalate": auto_escalate,
+        "auto_escalate":    auto_escalate,
     }
 
 
-def count_previous_customer_tickets(customer_id: Optional[str], db_path: str = DEFAULT_DB_PATH) -> int:
-    if not customer_id:
-        return 0
-    try:
-        with connect_db(db_path) as conn:
-            row = conn.execute("SELECT COUNT(*) AS count FROM tickets WHERE customer_id = ?", (customer_id,)).fetchone()
-        return int(row["count"] or 0)
-    except sqlite3.Error:
-        return 0
+# ═════════════════════════════════════════════════════════════════════════════
+# Tool: classify_ticket  (FIX P4)
+# Primary: LLM with OpenAI.  Fallback: keyword rules.  No more RAG-first.
+# ═════════════════════════════════════════════════════════════════════════════
 
-
-def keyword_classification(message: str) -> Dict[str, str]:
-    text = message.lower()
+def _keyword_classify(message: str) -> Dict[str, Any]:
+    """Last-resort keyword classifier — used ONLY when there is no API key."""
+    text  = message.lower()
     rules = [
-        (["login", "log in", "otp", "password", "2fa", "two factor"], "account_access", "cant_login"),
-        (["refund", "return", "pickup", "exchange"], "refund_return", "refund_not_received"),
-        (["wrong item", "different product", "sealed box"], "product_quality", "wrong_item_sent"),
-        (["damaged", "broken", "defective", "dead on arrival", "missing parts"], "product_quality", "damaged_in_transit"),
-        (["fake", "counterfeit", "serial number", "seller fraud"], "fake_counterfeit", "fake_product"),
-        (["double charged", "charged twice", "payment", "invoice", "coupon", "cashback", "emi"], "payment_billing", "double_charged"),
-        (["prime", "subscription", "free delivery", "video"], "prime_subscription", "prime_benefits_not_showing"),
-        (["delivered but", "not received", "never received", "marked delivered"], "delivery", "not_delivered"),
-        (["tracking", "out for delivery", "delayed", "late", "package"], "delivery", "tracking_not_updating"),
+        (["login", "log in", "otp", "password", "2fa", "two factor", "locked out"],
+         "account_access", "cant_login"),
+        (["account hacked", "unauthorized", "someone placed", "fraud"],
+         "account_access", "account_hacked"),
+        (["refund not received", "refund", "return", "pickup", "exchange"],
+         "refund_return", "refund_not_received"),
+        (["wrong item", "different product", "wrong model", "wrong color"],
+         "product_quality", "wrong_item_sent"),
+        (["damaged", "broken", "cracked", "shattered", "dead on arrival", "not working"],
+         "product_quality", "damaged_in_transit"),
+        (["fake", "counterfeit", "serial number", "not genuine", "original"],
+         "fake_counterfeit", "fake_product"),
+        (["double charged", "charged twice", "two debits", "duplicate charge"],
+         "payment_billing", "double_charged"),
+        (["payment failed", "money deducted", "upi", "net banking"],
+         "payment_billing", "payment_deducted_order_failed"),
+        (["coupon", "cashback", "discount not applied", "promo"],
+         "payment_billing", "coupon_not_applied"),
+        (["emi", "installment", "full amount charged"],
+         "payment_billing", "emi_not_applied"),
+        (["prime", "subscription", "prime video", "free delivery not"],
+         "prime_subscription", "prime_benefits_not_showing"),
+        (["marked delivered", "not received", "never received", "delivery photo"],
+         "delivery", "not_delivered"),
+        (["delayed", "late", "hasn't arrived", "waiting", "past expected"],
+         "delivery", "delayed_delivery"),
+        (["tracking", "in transit", "no update"],
+         "delivery", "tracking_not_updating"),
+        (["stolen", "left outside", "unattended", "lobby"],
+         "delivery", "package_stolen"),
     ]
     for keywords, category, sub_category in rules:
-        if any(keyword in text for keyword in keywords):
+        if any(kw in text for kw in keywords):
             return {
                 "category": category,
                 "sub_category": sub_category,
-                "classification_reason": f"Keyword match mapped the message to {category}/{sub_category}.",
+                "classification_reason": f"Keyword fallback: matched '{category}/{sub_category}'.",
+                "confidence": 0.4,
             }
     return {
         "category": "delivery",
-        "sub_category": "not_delivered",
-        "classification_reason": "Fallback default used because no strong keyword or AI/RAG signal was available.",
+        "sub_category": "delayed_delivery",
+        "classification_reason": "Default fallback — no strong signal found.",
+        "confidence": 0.2,
     }
 
 
-def search_classification_examples(message: str, limit: int = 5) -> List[Dict[str, Any]]:
-    try:
-        collection = get_chroma_collection()
-        if collection.count() == 0:
-            return []
-        query_embedding = get_embeddings_model().embed_query(message)
-        result = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=limit,
-            include=["documents", "metadatas", "distances"],
+def classify_ticket_with_llm(message: str, rag_examples: Optional[List[Dict]] = None) -> Dict[str, Any]:
+    """
+    FIX P4 — LLM is the PRIMARY classifier.
+    RAG examples are passed as optional few-shot context to improve accuracy.
+    Keywords only activate when OPENAI_API_KEY is absent.
+    Returns: {category, sub_category, classification_reason, confidence}
+    """
+    if not os.getenv("OPENAI_API_KEY"):
+        result = _keyword_classify(message)
+        result["rag_examples"] = rag_examples or []
+        return result
+
+    allowed_json = json.dumps(CATEGORY_SUBCATEGORIES, indent=2)
+
+    few_shot_block = ""
+    if rag_examples:
+        few_shot_block = "\n\nSimilar resolved tickets for reference:\n" + "\n".join(
+            f"  [{i+1}] category={ex['category']} sub_category={ex['sub_category']}\n"
+            f"       Message: {ex.get('text','')[:120]}"
+            for i, ex in enumerate(rag_examples[:5])
         )
-        examples = []
-        for index, metadata in enumerate(result.get("metadatas", [[]])[0]):
-            examples.append(
-                {
-                    "category": metadata.get("category"),
-                    "sub_category": metadata.get("sub_category"),
-                    "distance": result.get("distances", [[]])[0][index],
-                    "text": result.get("documents", [[]])[0][index][:500],
-                }
-            )
-        return examples
-    except Exception as exc:
-        print(f"Classification RAG fallback because: {exc}")
-        return []
 
+    prompt = f"""You are a customer support classifier for an Amazon-like e-commerce platform.
 
-def classify_ticket_with_rag(message: str) -> Dict[str, Any]:
-    examples = search_classification_examples(message)
-    fallback = keyword_classification(message)
+Classify the message below into exactly one category and sub_category from the allowed list.
+Return ONLY a JSON object with these keys:
+  - category          (string, from allowed list)
+  - sub_category      (string, from allowed list under that category)
+  - classification_reason  (string, ≤ 20 words explaining your choice)
+  - confidence        (float 0.0–1.0, how certain you are)
 
-    if not os.getenv("OPENAI_API_KEY") or not examples:
-        fallback["rag_examples"] = examples
-        return fallback
+Allowed taxonomy:
+{allowed_json}
+{few_shot_block}
 
-    allowed = json.dumps(CATEGORY_SUBCATEGORIES, indent=2)
-    example_text = "\n\n".join(
-        f"Example {index + 1}: category={item['category']} sub_category={item['sub_category']}\n{item['text']}"
-        for index, item in enumerate(examples)
-    )
-    prompt = f"""
-Classify the customer support message into exactly one allowed category and sub_category.
-Return only JSON with keys: category, sub_category, classification_reason.
+Customer message:
+\"\"\"{message}\"\"\"
 
-Allowed labels:
-{allowed}
-
-Similar resolved examples:
-{example_text}
-
-New message:
-{message}
-""".strip()
+Rules:
+- Pick the MOST SPECIFIC sub_category that fits.
+- If the customer mentions both payment and delivery, pick whichever is the primary complaint.
+- Do NOT output markdown fences, only raw JSON.
+"""
 
     try:
         response = get_chat_model().invoke(prompt)
-        content = response.content.strip()
-        content = content[content.find("{") : content.rfind("}") + 1]
-        parsed = json.loads(content)
-        category = parsed.get("category")
-        sub_category = parsed.get("sub_category")
-        if category in CATEGORY_SUBCATEGORIES and sub_category in CATEGORY_SUBCATEGORIES[category]:
-            parsed["rag_examples"] = examples
+        content  = response.content.strip()
+        # Strip any accidental markdown fences
+        content  = re.sub(r"^```[a-z]*\n?", "", content, flags=re.MULTILINE)
+        content  = re.sub(r"```$", "", content, flags=re.MULTILINE).strip()
+        # Extract the JSON object
+        start, end = content.find("{"), content.rfind("}")
+        if start == -1 or end == -1:
+            raise ValueError("No JSON object found in LLM response")
+        parsed = json.loads(content[start:end+1])
+
+        cat = parsed.get("category", "")
+        sub = parsed.get("sub_category", "")
+        if cat in CATEGORY_SUBCATEGORIES and sub in CATEGORY_SUBCATEGORIES[cat]:
+            parsed["rag_examples"] = rag_examples or []
             return parsed
-    except Exception as exc:
-        print(f"LLM classification fallback because: {exc}")
-
-    fallback["rag_examples"] = examples
-    return fallback
-
-
-def calculate_enrichment_scores(
-    category: str,
-    order_value: float,
-    is_repeat_contact: bool,
-    resolution_status: str = "pending",
-) -> Dict[str, Any]:
-    sentiment_score = BASE_SENTIMENTS.get(category, -0.55)
-    frustration_base = -sentiment_score
-    if order_value > 10000:
-        frustration_base += 0.30
-    if is_repeat_contact:
-        frustration_base += 0.25
-    if resolution_status in {"unresolved", "escalated"}:
-        frustration_base += 0.20
-
-    if frustration_base < 0.20:
-        frustration_level = "low"
-    elif frustration_base <= 0.50:
-        frustration_level = "medium"
-    elif frustration_base <= 0.80:
-        frustration_level = "high"
-    else:
-        frustration_level = "critical"
-
-    urgency_score = min(1.0, BASE_URGENCY.get(category, 0.55) + (order_value / 200000))
-    revenue_at_risk = (
-        order_value
-        if resolution_status in {"unresolved", "escalated"} and frustration_level in {"high", "critical"}
-        else 0.0
-    )
-    return {
-        "sentiment_score": round(sentiment_score, 3),
-        "frustration_level": frustration_level,
-        "urgency_score": round(urgency_score, 3),
-        "revenue_at_risk": round(revenue_at_risk, 2),
-    }
-
-
-def draft_ticket_fields(raw_ticket: Dict[str, Any], db_path: str = DEFAULT_DB_PATH) -> Dict[str, Any]:
-    message = raw_ticket["message"]
-    order_value = float(raw_ticket.get("order_value") or 0)
-    customer_id = raw_ticket.get("customer_id")
-    is_repeat_contact = count_previous_customer_tickets(customer_id, db_path) > 0
-    classification = classify_ticket_with_rag(message)
-    resolution_status = "pending"
-    scores = calculate_enrichment_scores(
-        classification["category"],
-        order_value,
-        is_repeat_contact,
-        resolution_status,
-    )
-    entities = extract_key_entities(
-        {
-            "message": message,
-            "order_id": raw_ticket.get("order_id") or "",
-            "product_sku": raw_ticket.get("product_sku") or "",
-        }
-    )
-    summary = raw_ticket.get("summary") or message[:180]
-    return {
-        **raw_ticket,
-        "resolution_status": resolution_status,
-        "is_repeat_contact": is_repeat_contact,
-        "category": classification["category"],
-        "sub_category": classification["sub_category"],
-        "sentiment_score": scores["sentiment_score"],
-        "frustration_level": scores["frustration_level"],
-        "urgency_score": scores["urgency_score"],
-        "revenue_at_risk": scores["revenue_at_risk"],
-        "summary": summary,
-        "key_entities": entities,
-        "suggested_fields_reason": classification.get("classification_reason", "Generated by RAG-assisted classification."),
-        "rag_examples": classification.get("rag_examples", []),
-    }
-
-
-def get_embeddings_model() -> Any:
-    if OpenAIEmbeddings is None:
-        raise RuntimeError("langchain-openai is not installed. Run: pip install -r requirements.txt")
-    return OpenAIEmbeddings(model=EMBEDDING_MODEL)
-
-
-def get_chroma_collection() -> Any:
-    if chromadb is None:
-        raise RuntimeError("chromadb is not installed. Run: pip install -r requirements.txt")
-    Path(CHROMA_PATH).mkdir(exist_ok=True)
-    client = chromadb.PersistentClient(path=CHROMA_PATH)
-    return client.get_or_create_collection(name=COLLECTION_NAME)
-
-
-def seed_chroma_from_sqlite(db_path: str = DEFAULT_DB_PATH, max_vectors: Optional[int] = None) -> Dict[str, Any]:
-    collection = get_chroma_collection()
-    try:
-        existing = collection.count()
-        if existing:
-            client = chromadb.PersistentClient(path=CHROMA_PATH)
-            client.delete_collection(COLLECTION_NAME)
-            collection = client.create_collection(name=COLLECTION_NAME)
-    except Exception:
-        collection = get_chroma_collection()
-
-    with connect_db(db_path) as conn:
-        query = """
-            SELECT ticket_id, message, agent_reply, category, sub_category,
-                   resolution_status, customer_tier, product_sku
-            FROM tickets
-            WHERE resolution_status = 'resolved'
-              AND agent_reply IS NOT NULL
-              AND TRIM(agent_reply) != ''
-            ORDER BY timestamp DESC
-        """
-        if max_vectors:
-            query += " LIMIT ?"
-            rows = conn.execute(query, (max_vectors,)).fetchall()
         else:
-            rows = conn.execute(query).fetchall()
+            # LLM hallucinated a label — try to recover
+            print(f"[Agent 1] LLM returned invalid label {cat}/{sub}, falling back to keywords")
+    except Exception as exc:
+        print(f"[Agent 1] LLM classification error: {exc}")
 
-    embeddings_model = get_embeddings_model()
-    batch_size = 64
-    added = 0
-    for start in range(0, len(rows), batch_size):
-        batch = rows[start : start + batch_size]
-        docs = [f"Customer message: {row['message']}\nAgent reply: {row['agent_reply']}" for row in batch]
-        embeddings = embeddings_model.embed_documents(docs)
-        collection.add(
-            ids=[row["ticket_id"] for row in batch],
-            documents=docs,
-            embeddings=embeddings,
-            metadatas=[
-                {
-                    "ticket_id": row["ticket_id"],
-                    "category": row["category"],
-                    "sub_category": row["sub_category"],
-                    "resolution_status": row["resolution_status"],
-                    "customer_tier": row["customer_tier"],
-                    "product_sku": row["product_sku"],
-                    "agent_reply": row["agent_reply"],
-                }
-                for row in batch
-            ],
-        )
-        added += len(batch)
-        print(f"Chroma seed progress: {added}/{len(rows)} vectors")
-
-    return {"collection": COLLECTION_NAME, "persist_path": CHROMA_PATH, "vectors_added": added}
+    # Keyword fallback
+    result = _keyword_classify(message)
+    result["rag_examples"] = rag_examples or []
+    return result
 
 
-def fallback_similar_tickets(sub_category: str, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+# ═════════════════════════════════════════════════════════════════════════════
+# Tool: search_similar_tickets (Chroma RAG)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _fallback_similar_tickets(sub_category: str, db_path: str) -> List[Dict[str, Any]]:
+    """SQL fallback when Chroma is unavailable."""
     with connect_db(db_path) as conn:
         rows = conn.execute(
             """
@@ -541,202 +524,475 @@ def fallback_similar_tickets(sub_category: str, db_path: str = DEFAULT_DB_PATH) 
     return [row_to_dict(row) for row in rows]
 
 
-def search_similar_tickets(ticket: Dict[str, Any], db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+def search_similar_tickets(
+    ticket:    Dict[str, Any],
+    db_path:   str = DEFAULT_DB_PATH,
+    n_results: int = 3,
+) -> List[Dict[str, Any]]:
     sub_category = ticket.get("sub_category") or ""
-    if not sub_category:
+    message      = ticket.get("message") or ""
+    if not sub_category or not message:
         return []
+
     try:
         collection = get_chroma_collection()
         if collection.count() == 0:
-            return fallback_similar_tickets(sub_category, db_path)
-        query_embedding = get_embeddings_model().embed_query(ticket.get("message") or "")
+            return _fallback_similar_tickets(sub_category, db_path)
+
+        query_embedding = get_embeddings_model().embed_query(message)
         result = collection.query(
             query_embeddings=[query_embedding],
-            n_results=3,
+            n_results=n_results,
             where={"sub_category": sub_category},
             include=["documents", "metadatas", "distances"],
         )
-        matches = []
-        for index, metadata in enumerate(result.get("metadatas", [[]])[0]):
-            matches.append(
-                {
-                    "ticket_id": metadata.get("ticket_id"),
-                    "message_and_reply": result.get("documents", [[]])[0][index],
-                    "agent_reply": metadata.get("agent_reply"),
-                    "distance": result.get("distances", [[]])[0][index],
-                    "sub_category": metadata.get("sub_category"),
-                }
-            )
-        return matches or fallback_similar_tickets(sub_category, db_path)
+        distances    = result.get("distances", [[]])[0]
+        similarities = distances_to_similarity_percent(distances)
+        matches = [
+            {
+                "ticket_id":         meta.get("ticket_id"),
+                "message_and_reply": result.get("documents", [[]])[0][i],
+                "agent_reply":       meta.get("agent_reply"),
+                "distance":          distances[i],
+                "similarity_percent":similarities[i],
+                "sub_category":      meta.get("sub_category"),
+            }
+            for i, meta in enumerate(result.get("metadatas", [[]])[0])
+        ]
+        return matches or _fallback_similar_tickets(sub_category, db_path)
+
     except Exception as exc:
-        print(f"Chroma search fallback because: {exc}")
-        return fallback_similar_tickets(sub_category, db_path)
+        print(f"[Agent 1] Chroma search error ({exc}), using SQL fallback")
+        return _fallback_similar_tickets(sub_category, db_path)
 
 
-def get_chat_model() -> Any:
-    if ChatOpenAI is None:
-        raise RuntimeError("langchain-openai is not installed. Run: pip install -r requirements.txt")
-    return ChatOpenAI(model=CHAT_MODEL, temperature=0.2)
+def search_classification_examples(message: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Pull RAG examples used as few-shot context for LLM classification."""
+    try:
+        collection = get_chroma_collection()
+        if collection.count() == 0:
+            return []
+        query_embedding = get_embeddings_model().embed_query(message)
+        result = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=limit,
+            include=["documents", "metadatas", "distances"],
+        )
+        distances    = result.get("distances", [[]])[0]
+        similarities = distances_to_similarity_percent(distances)
+        return [
+            {
+                "ticket_id":         meta.get("ticket_id"),
+                "category":          meta.get("category"),
+                "sub_category":      meta.get("sub_category"),
+                "text":              result.get("documents", [[]])[0][i],
+                "agent_reply":       meta.get("agent_reply"),
+                "similarity_percent":similarities[i],
+            }
+            for i, meta in enumerate(result.get("metadatas", [[]])[0])
+        ]
+    except Exception as exc:
+        print(f"[Agent 1] Classification RAG lookup error: {exc}")
+        return []
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Tool: extract_key_entities
+# ═════════════════════════════════════════════════════════════════════════════
 
 def extract_key_entities(ticket: Dict[str, Any]) -> List[str]:
-    text = f"{ticket.get('message', '')} {ticket.get('order_id', '')} {ticket.get('product_sku', '')}"
-    regex_entities = sorted(set(re.findall(r"\b(?:AMZ-[A-Z0-9-]+|[A-Z]{2,}[A-Z0-9-]{2,}|₹\s?[\d,]+(?:\.\d+)?)\b", text)))
+    text  = f"{ticket.get('message','')}\n{ticket.get('order_id','')}\n{ticket.get('product_sku','')}"
+    regex = sorted(set(re.findall(
+        r"\b(?:AMZ-[A-Z0-9-]+|TKT-[A-Z0-9]+|[A-Z]{2,}[A-Z0-9-]{2,}|₹\s?[\d,]+(?:\.\d+)?)\b",
+        text,
+    )))
 
     if not os.getenv("OPENAI_API_KEY"):
-        return regex_entities
+        return regex
 
     try:
         prompt = (
-            "Extract only important support-ticket entities as a compact JSON array of strings. "
-            "Include order IDs, product SKUs, money amounts, dates, brands, and issue nouns. "
-            f"Ticket: {ticket.get('message', '')}"
+            "Extract all important customer-support entities from the ticket text as a JSON array of strings. "
+            "Include: order IDs, product SKUs, money amounts (with ₹ symbol), dates, brand names, "
+            "and key issue nouns. Return ONLY the JSON array, no fences.\n\n"
+            f"Ticket: {ticket.get('message','')}"
         )
         response = get_chat_model().invoke(prompt)
-        content = response.content.strip()
-        parsed = json.loads(content) if content.startswith("[") else regex_entities
-        return sorted(set(str(item) for item in parsed + regex_entities))
+        content  = response.content.strip().lstrip("```json").rstrip("```").strip()
+        parsed   = json.loads(content) if content.startswith("[") else regex
+        return sorted(set(str(e) for e in parsed + regex))
     except Exception as exc:
-        print(f"Entity extraction fallback because: {exc}")
-        return regex_entities
+        print(f"[Agent 1] Entity extraction error: {exc}")
+        return regex
 
 
-def generate_reply(ticket: Dict[str, Any], order_details: Dict[str, Any], similar_tickets: List[Dict[str, Any]]) -> str:
-    if ticket.get("category") == "account_access" and ticket.get("sub_category") == "cant_login":
-        return (
-            f"Hi {ticket.get('customer_name', 'there')}, I understand you are unable to log in. "
-            "Please reset your password and verify the OTP sent to your registered phone or email. "
-            "If the OTP does not arrive within 5 minutes, reply here and we will escalate account recovery."
-        )
+# ═════════════════════════════════════════════════════════════════════════════
+# Tool: generate_reply
+# ═════════════════════════════════════════════════════════════════════════════
 
-    examples = "\n\n".join(
-        f"Example {index + 1}:\n{item.get('message_and_reply') or item.get('agent_reply')}"
-        for index, item in enumerate(similar_tickets)
+def generate_reply(
+    ticket:         Dict[str, Any],
+    order_details:  Dict[str, Any],
+    similar_tickets: List[Dict[str, Any]],
+) -> str:
+    name = ticket.get("customer_name", "there")
+
+    # Template replies for known auto-resolve patterns (no tokens wasted)
+    sub = ticket.get("sub_category", "")
+    if sub in AUTO_RESOLVE_REPLIES:
+        return AUTO_RESOLVE_REPLIES[sub].format(name=name.split()[0])
+
+    few_shot = "\n\n".join(
+        f"Example {i+1}:\n{ex.get('message_and_reply') or ex.get('agent_reply','')}"
+        for i, ex in enumerate(similar_tickets)
     )
-    prompt = f"""
-You are an Amazon customer support assistant. Write one concise, empathetic, actionable reply.
 
-Customer name: {ticket.get('customer_name')}
-Customer tier: {ticket.get('customer_tier')}
-Order ID: {ticket.get('order_id')}
-Product SKU: {order_details.get('product_sku') or ticket.get('product_sku')}
-Order value: {ticket.get('order_value')}
-Category: {ticket.get('category')} / {ticket.get('sub_category')}
-Customer message: {ticket.get('message')}
+    prompt = f"""You are a senior Amazon customer support agent. Write one concise, empathetic, 
+actionable reply to this customer complaint. Be specific — reference the order ID, SKU, and amount.
 
-Use these resolved examples for style and policy:
-{examples or 'No examples available. Use a careful support tone.'}
-""".strip()
+Customer name:  {name}
+Customer tier:  {ticket.get('customer_tier')}
+Order ID:       {ticket.get('order_id')}
+Product SKU:    {order_details.get('product_sku') or ticket.get('product_sku')}
+Order value:    ₹{ticket.get('order_value')}
+Category:       {ticket.get('category')} / {ticket.get('sub_category')}
+Frustration:    {ticket.get('frustration_level')}
+Message:        {ticket.get('message')}
+
+Style examples from resolved similar tickets:
+{few_shot or 'No examples available. Use a careful, empathetic support tone.'}
+
+Rules:
+- Start with "Hi {name.split()[0]},"
+- Acknowledge the specific issue in the first sentence
+- Give a concrete action or timeline (not vague "we will help")
+- For prime_plus or high order values, offer a goodwill gesture (small credit / priority handling)
+- Keep it under 80 words
+"""
 
     if not os.getenv("OPENAI_API_KEY"):
         return (
-            f"Hi {ticket.get('customer_name', 'there')}, I understand the issue with order "
-            f"{ticket.get('order_id')}. I have reviewed the details and will help resolve this as quickly as possible. "
-            "We will update you with the next action shortly."
+            f"Hi {name.split()[0]}, I understand the issue with order {ticket.get('order_id')}. "
+            "I've reviewed the details and will help resolve this as quickly as possible. "
+            "You'll receive an update within 24 hours."
         )
 
     try:
-        response = get_chat_model().invoke(prompt)
-        return response.content.strip()
+        return get_chat_model().invoke(prompt).content.strip()
     except Exception as exc:
-        print(f"Reply generation fallback because: {exc}")
+        print(f"[Agent 1] Reply generation error: {exc}")
         return (
-            f"Hi {ticket.get('customer_name', 'there')}, I understand the issue with order "
-            f"{ticket.get('order_id')}. I have reviewed the details and will help resolve this as quickly as possible. "
-            "We will update you with the next action shortly."
+            f"Hi {name.split()[0]}, I understand the issue with order {ticket.get('order_id')}. "
+            "I've reviewed the details and will help resolve this quickly."
         )
 
 
-def escalate_to_human(ticket_id: str, reason: str, steps: List[str], db_path: str = DEFAULT_DB_PATH) -> None:
-    ticket = fetch_ticket(ticket_id, db_path)
+# ═════════════════════════════════════════════════════════════════════════════
+# Tool: enrichment scores
+# ═════════════════════════════════════════════════════════════════════════════
+
+def calculate_enrichment_scores(
+    category:          str,
+    order_value:       float,
+    is_repeat_contact: bool,
+    resolution_status: str = "pending",
+) -> Dict[str, Any]:
+    sentiment_score   = BASE_SENTIMENTS.get(category, -0.55)
+    frustration_base  = -sentiment_score
+    if order_value > 10_000:      frustration_base += 0.30
+    if is_repeat_contact:          frustration_base += 0.25
+    if resolution_status in {"unresolved", "escalated"}:
+        frustration_base += 0.20
+
+    if frustration_base < 0.20:    frustration_level = "low"
+    elif frustration_base <= 0.50: frustration_level = "medium"
+    elif frustration_base <= 0.80: frustration_level = "high"
+    else:                           frustration_level = "critical"
+
+    urgency_score  = min(1.0, BASE_URGENCY.get(category, 0.55) + (order_value / 200_000))
+    revenue_at_risk = (
+        order_value
+        if resolution_status in {"unresolved", "escalated"}
+        and frustration_level in {"high", "critical"}
+        else 0.0
+    )
+    return {
+        "sentiment_score":   round(sentiment_score, 3),
+        "frustration_level": frustration_level,
+        "urgency_score":     round(urgency_score, 3),
+        "revenue_at_risk":   round(revenue_at_risk, 2),
+    }
+
+
+def count_previous_customer_tickets(
+    customer_id: Optional[str],
+    db_path:     str = DEFAULT_DB_PATH,
+) -> int:
+    if not customer_id:
+        return 0
+    try:
+        with connect_db(db_path) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM tickets WHERE customer_id = ?",
+                (customer_id,),
+            ).fetchone()
+        return int(row["count"] or 0)
+    except sqlite3.Error:
+        return 0
+
+
+def draft_ticket_fields(
+    raw_ticket: Dict[str, Any],
+    db_path:    str = DEFAULT_DB_PATH,
+) -> Dict[str, Any]:
+    message       = raw_ticket["message"]
+    order_value   = float(raw_ticket.get("order_value") or 0)
+    customer_id   = raw_ticket.get("customer_id")
+    is_repeat     = count_previous_customer_tickets(customer_id, db_path) > 0
+
+    # P4 FIX: Pull RAG examples first, pass as few-shot to LLM classifier
+    rag_examples   = search_classification_examples(message)
+    classification = classify_ticket_with_llm(message, rag_examples)
+
+    resolution_status = "pending"
+    scores = calculate_enrichment_scores(
+        classification["category"], order_value, is_repeat, resolution_status,
+    )
+    entities = extract_key_entities({
+        "message":     message,
+        "order_id":    raw_ticket.get("order_id") or "",
+        "product_sku": raw_ticket.get("product_sku") or "",
+    })
+    summary = raw_ticket.get("summary") or message[:180]
+
+    return {
+        **raw_ticket,
+        "resolution_status":      resolution_status,
+        "is_repeat_contact":      is_repeat,
+        "category":               classification["category"],
+        "sub_category":           classification["sub_category"],
+        "sentiment_score":        scores["sentiment_score"],
+        "frustration_level":      scores["frustration_level"],
+        "urgency_score":          scores["urgency_score"],
+        "revenue_at_risk":        scores["revenue_at_risk"],
+        "summary":                summary,
+        "key_entities":           entities,
+        "suggested_fields_reason":classification.get("classification_reason", "LLM-classified."),
+        "rag_examples":           classification.get("rag_examples", []),
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DB write helpers (used by nodes)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def escalate_to_human(
+    ticket_id: str,
+    reason:    str,
+    steps:     List[str],
+    db_path:   str = DEFAULT_DB_PATH,
+) -> None:
+    ticket      = fetch_ticket(ticket_id, db_path)
     order_value = float(ticket.get("order_value") or 0)
     frustration = ticket.get("frustration_level")
-    update_ticket_fields(
-        ticket_id,
-        {
-            "resolution_status": "escalated",
-            "revenue_at_risk": order_value if frustration in {"high", "critical"} else 0.0,
-            "agent_decision": "escalate",
-            "agent_reason": reason,
-            "agent_steps": steps,
-        },
-        db_path,
-    )
+    update_ticket_fields(ticket_id, {
+        "resolution_status": "escalated",
+        "revenue_at_risk":   order_value if frustration in {"high", "critical"} else 0.0,
+        "agent_decision":    "escalate",
+        "agent_reason":      reason,
+        "agent_steps":       steps,   # serialised by update_ticket_fields
+    }, db_path)
 
 
-def auto_resolve(ticket_id: str, reply: str, steps: List[str], db_path: str = DEFAULT_DB_PATH) -> None:
-    update_ticket_fields(
-        ticket_id,
-        {
-            "resolution_status": "resolved",
-            "revenue_at_risk": 0.0,
-            "suggested_reply": reply,
-            "agent_decision": "auto_resolve",
-            "agent_reason": "Simple account login issue handled with standard OTP/reset guidance.",
-            "agent_steps": steps,
-        },
-        db_path,
-    )
+def auto_resolve(
+    ticket_id: str,
+    reply:     str,
+    reason:    str,
+    steps:     List[str],
+    db_path:   str = DEFAULT_DB_PATH,
+) -> None:
+    update_ticket_fields(ticket_id, {
+        "resolution_status": "resolved",
+        "revenue_at_risk":   0.0,
+        "suggested_reply":   reply,
+        "agent_decision":    "auto_resolve",
+        "agent_reason":      reason,
+        "agent_steps":       steps,
+    }, db_path)
 
 
-def save_suggested_reply(ticket_id: str, reply: str, reason: str, steps: List[str], db_path: str = DEFAULT_DB_PATH) -> None:
-    update_ticket_fields(
-        ticket_id,
-        {
-            "suggested_reply": reply,
-            "agent_decision": "suggest_reply",
-            "agent_reason": reason,
-            "agent_steps": steps,
-        },
-        db_path,
-    )
+def save_suggested_reply(
+    ticket_id: str,
+    reply:     str,
+    reason:    str,
+    steps:     List[str],
+    db_path:   str = DEFAULT_DB_PATH,
+) -> None:
+    update_ticket_fields(ticket_id, {
+        "suggested_reply": reply,
+        "agent_decision":  "suggest_reply",
+        "agent_reason":    reason,
+        "agent_steps":     steps,
+    }, db_path)
 
 
-# Agent/helper functions
-# Each node is intentionally small and prints its state update for learning and debugging.
+# ═════════════════════════════════════════════════════════════════════════════
+# Chroma seeding helper (unchanged from v1, preserved here for completeness)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def seed_chroma_from_sqlite(
+    db_path:     str = DEFAULT_DB_PATH,
+    max_vectors: Optional[int] = None,
+) -> Dict[str, Any]:
+    collection = get_chroma_collection()
+    try:
+        if collection.count():
+            client = chromadb.PersistentClient(path=CHROMA_PATH)
+            client.delete_collection(COLLECTION_NAME)
+            collection = client.create_collection(
+                name=COLLECTION_NAME,
+                metadata={"hnsw:space": CHROMA_DISTANCE},
+            )
+    except Exception:
+        collection = get_chroma_collection()
+
+    with connect_db(db_path) as conn:
+        query = """
+            SELECT ticket_id, message, agent_reply, category, sub_category,
+                   resolution_status, customer_tier, product_sku
+            FROM tickets
+            WHERE resolution_status = 'resolved'
+              AND agent_reply IS NOT NULL
+              AND TRIM(agent_reply) != ''
+            ORDER BY timestamp DESC
+        """
+        rows = (
+            conn.execute(query + " LIMIT ?", (max_vectors,)).fetchall()
+            if max_vectors else
+            conn.execute(query).fetchall()
+        )
+
+    model   = get_embeddings_model()
+    added   = 0
+    batch_sz = 64
+    for start in range(0, len(rows), batch_sz):
+        batch = rows[start:start + batch_sz]
+        docs  = [
+            f"Customer message: {r['message']}\nAgent reply: {r['agent_reply']}"
+            for r in batch
+        ]
+        embeds = model.embed_documents(docs)
+        collection.add(
+            ids=[r["ticket_id"] for r in batch],
+            documents=docs,
+            embeddings=embeds,
+            metadatas=[{
+                "ticket_id":        r["ticket_id"],
+                "category":         r["category"],
+                "sub_category":     r["sub_category"],
+                "resolution_status":r["resolution_status"],
+                "customer_tier":    r["customer_tier"],
+                "product_sku":      r["product_sku"],
+                "agent_reply":      r["agent_reply"],
+            } for r in batch],
+        )
+        added += len(batch)
+        print(f"[Chroma seed] {added}/{len(rows)} vectors")
+
+    return {"collection": COLLECTION_NAME, "persist_path": CHROMA_PATH, "vectors_added": added}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Step helper
+# ═════════════════════════════════════════════════════════════════════════════
+
 def add_step(state: Agent1State, message: str) -> Agent1State:
-    steps = list(state.get("agent_steps", []))
+    # P6 FIX: always work with a proper Python list
+    steps = _safe_load_json_list(state.get("agent_steps", []))
     steps.append(message)
     state["agent_steps"] = steps
     print(f"[Agent 1] {message}")
     return state
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ── GRAPH NODES ───────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Node 1: load_ticket ───────────────────────────────────────────────────────
 def node_load_ticket(state: Agent1State) -> Agent1State:
     ticket = fetch_ticket(state["ticket_id"], state.get("db_path", DEFAULT_DB_PATH))
-    state["ticket"] = ticket
+    state["ticket"]       = ticket
+    state["agent_steps"]  = []          # fresh list on every run
     state["key_entities"] = extract_key_entities(ticket)
     update_ticket_fields(
         state["ticket_id"],
         {"key_entities": state["key_entities"]},
         state.get("db_path", DEFAULT_DB_PATH),
     )
-    return add_step(state, f"Loaded ticket {ticket['ticket_id']} and extracted entities: {state['key_entities']}")
+    return add_step(state,
+        f"Loaded ticket {ticket['ticket_id']} | "
+        f"category={ticket.get('category')} sub={ticket.get('sub_category')} | "
+        f"tier={ticket.get('customer_tier')} | "
+        f"order_value=₹{ticket.get('order_value')} | "
+        f"entities={state['key_entities']}"
+    )
 
 
+# ── Node 2: customer_history ──────────────────────────────────────────────────
 def node_customer_history(state: Agent1State) -> Agent1State:
-    ticket = state["ticket"]
-    history = get_customer_history(ticket["customer_id"], ticket["ticket_id"], state.get("db_path", DEFAULT_DB_PATH))
+    ticket  = state["ticket"]
+    history = get_customer_history(
+        ticket["customer_id"], ticket["ticket_id"],
+        state.get("db_path", DEFAULT_DB_PATH),
+    )
     state["customer_history"] = history
-    unresolved = sum(1 for item in history if item.get("resolution_status") in {"unresolved", "escalated", "pending"})
-    return add_step(state, f"Fetched {len(history)} prior customer tickets; {unresolved} are still risky.")
+    unresolved = sum(
+        1 for t in history
+        if t.get("resolution_status") in {"unresolved", "escalated", "pending"}
+    )
+    return add_step(state,
+        f"Customer history: {len(history)} prior tickets | {unresolved} still open/unresolved"
+    )
 
 
+# ── Node 3: order_details ─────────────────────────────────────────────────────
 def node_order_details(state: Agent1State) -> Agent1State:
     ticket = state["ticket"]
-    order = get_order_details(ticket["order_id"], state.get("db_path", DEFAULT_DB_PATH))
+    order  = get_order_details(ticket["order_id"], state.get("db_path", DEFAULT_DB_PATH))
     state["order_details"] = order
-    return add_step(state, f"Fetched order details for {ticket['order_id']}: SKU={order.get('product_sku')}.")
+    return add_step(state,
+        f"Order details: order_id={ticket['order_id']} | "
+        f"SKU={order.get('product_sku')} | "
+        f"value=₹{order.get('order_value')} | "
+        f"date={order.get('order_date')}"
+    )
 
 
+# ── Node 4: check_incident ────────────────────────────────────────────────────
+# FIX P3: ONLY reads from incidents table written by Agent 2. Zero hardcoding.
 def node_check_incident(state: Agent1State) -> Agent1State:
     incident = check_active_incidents(state["ticket"], state.get("db_path", DEFAULT_DB_PATH))
     state["active_incident"] = incident
     if incident:
-        return add_step(state, f"Active incident found: {incident['title']} ({incident['severity']}).")
-    return add_step(state, "No active incident found for this ticket context.")
+        return add_step(state,
+            f"🚨 Active incident: '{incident['title']}' | "
+            f"severity={incident['severity']} | "
+            f"SKU={incident.get('affected_sku')}"
+        )
+    return add_step(state, "No active Agent-2 incident for this SKU/category.")
 
 
+# ── Route A: after check_incident — fast-exit for critical incidents ──────────
+# FIX P1 (first branch): critical severity incidents skip priority calculation
+def route_after_incident(state: Agent1State) -> str:
+    incident = state.get("active_incident")
+    if incident and incident.get("severity") == "critical":
+        return "escalate_direct"   # skip priority calc — critical incident → always escalate
+    return "calculate_priority"
+
+
+# ── Node 5: calculate_priority ────────────────────────────────────────────────
 def node_calculate_priority(state: Agent1State) -> Agent1State:
     result = calculate_priority(
         state["ticket"],
@@ -744,114 +1000,232 @@ def node_calculate_priority(state: Agent1State) -> Agent1State:
         state.get("active_incident"),
     )
     state.update(result)
-    return add_step(
-        state,
-        f"Calculated priority={state['priority_score']} frustration={state['frustration_level']} auto_escalate={state['auto_escalate']}.",
+    return add_step(state,
+        f"Priority score={state['priority_score']} | "
+        f"frustration={state['frustration_level']} | "
+        f"auto_escalate={state['auto_escalate']}"
     )
 
 
+# ── Route B: after calculate_priority — 3-way split ──────────────────────────
+# FIX P1 (main branch) + FIX P5 (auto-resolve detected here, not in finalize)
 def route_after_priority(state: Agent1State) -> str:
-    return "escalate" if state.get("auto_escalate") else "retrieve"
+    ticket = state["ticket"]
+    cat    = ticket.get("category", "")
+    sub    = ticket.get("sub_category", "")
+
+    # P5 FIX: detect auto-resolvable tickets HERE, before any RAG/reply work
+    if sub in AUTO_RESOLVE_SUBCATEGORIES and not state.get("auto_escalate"):
+        return "auto_resolve_direct"
+
+    # FIX P1: always-escalate categories — legal/security risk
+    if cat in ALWAYS_ESCALATE_CATEGORIES or sub in ALWAYS_ESCALATE_SUBCATEGORIES:
+        return "escalate_direct"
+
+    if state.get("auto_escalate"):
+        return "escalate_direct"
+
+    return "retrieve_similar"
 
 
-def node_search_similar(state: Agent1State) -> Agent1State:
-    matches = search_similar_tickets(state["ticket"], state.get("db_path", DEFAULT_DB_PATH))
-    state["similar_tickets"] = matches
-    return add_step(state, f"Retrieved {len(matches)} similar resolved tickets for reply grounding.")
-
-
-def node_generate_reply(state: Agent1State) -> Agent1State:
-    reply = generate_reply(state["ticket"], state.get("order_details", {}), state.get("similar_tickets", []))
-    state["suggested_reply"] = reply
-    return add_step(state, "Generated suggested reply.")
-
-
+# ── Node 6a: escalate_ticket (from either route) ──────────────────────────────
 def node_escalate_ticket(state: Agent1State) -> Agent1State:
-    ticket = state["ticket"]
+    ticket   = state["ticket"]
     incident = state.get("active_incident")
-    reason = (
-        f"Escalated because priority={state.get('priority_score')} for {ticket.get('customer_tier')} customer, "
-        f"order_value={ticket.get('order_value')}, incident={incident.get('title') if incident else 'none'}."
-    )
+    cat      = ticket.get("category", "")
+    sub      = ticket.get("sub_category", "")
+
+    if cat in ALWAYS_ESCALATE_CATEGORIES or sub in ALWAYS_ESCALATE_SUBCATEGORIES:
+        reason = (
+            f"Escalated — category '{cat}/{sub}' requires legal/security review. "
+            f"Never suggest a reply for fraud or security breach tickets. "
+            f"Customer tier: {ticket.get('customer_tier')} | "
+            f"Order value: ₹{ticket.get('order_value')}"
+        )
+    elif incident:
+        reason = (
+            f"Escalated — active incident '{incident['title']}' "
+            f"(severity={incident['severity']}) flagged by Agent 2 for SKU "
+            f"'{incident.get('affected_sku')}'. "
+            f"Priority score: {state.get('priority_score')} | "
+            f"Customer tier: {ticket.get('customer_tier')}"
+        )
+    else:
+        reason = (
+            f"Escalated — priority_score={state.get('priority_score')} "
+            f"for {ticket.get('customer_tier')} customer | "
+            f"order_value=₹{ticket.get('order_value')} | "
+            f"frustration={state.get('frustration_level')}"
+        )
+
     state["decision"] = "escalate"
-    state["reason"] = reason
-    add_step(state, reason)
-    escalate_to_human(ticket["ticket_id"], reason, state.get("agent_steps", []), state.get("db_path", DEFAULT_DB_PATH))
+    state["reason"]   = reason
+    add_step(state, f"🔺 DECISION: ESCALATE — {reason}")
+    escalate_to_human(
+        ticket["ticket_id"], reason,
+        state.get("agent_steps", []),
+        state.get("db_path", DEFAULT_DB_PATH),
+    )
     return state
 
 
-def node_finalize_reply(state: Agent1State) -> Agent1State:
+# ── Node 6b: auto_resolve_direct ─────────────────────────────────────────────
+# FIX P5: auto-resolve happens before any reply generation or RAG search
+def node_auto_resolve(state: Agent1State) -> Agent1State:
     ticket = state["ticket"]
-    reply = state.get("suggested_reply", "")
-    if ticket.get("category") == "account_access" and ticket.get("sub_category") == "cant_login":
-        state["decision"] = "auto_resolve"
-        state["reason"] = "Auto-resolved simple login issue with standard OTP/reset guidance."
-        add_step(state, state["reason"])
-        auto_resolve(ticket["ticket_id"], reply, state.get("agent_steps", []), state.get("db_path", DEFAULT_DB_PATH))
-        return state
+    sub    = ticket.get("sub_category", "cant_login")
+    name   = ticket.get("customer_name", "there")
+    reply  = AUTO_RESOLVE_REPLIES.get(sub, AUTO_RESOLVE_REPLIES["cant_login"])
+    reply  = reply.format(name=name.split()[0])
+    reason = f"Auto-resolved '{sub}' — standard guidance reply issued. No LLM tokens used."
 
-    state["decision"] = "suggest_reply"
-    state["reason"] = "Suggested a personalized support reply grounded in similar resolved tickets."
-    add_step(state, state["reason"])
-    save_suggested_reply(ticket["ticket_id"], reply, state["reason"], state.get("agent_steps", []), state.get("db_path", DEFAULT_DB_PATH))
+    state["suggested_reply"] = reply
+    state["decision"]        = "auto_resolve"
+    state["reason"]          = reason
+    add_step(state, f"✅ DECISION: AUTO-RESOLVE — {sub}")
+    auto_resolve(
+        ticket["ticket_id"], reply, reason,
+        state.get("agent_steps", []),
+        state.get("db_path", DEFAULT_DB_PATH),
+    )
     return state
 
 
-def run_agent1_for_ticket(ticket_id: str, db_path: str = DEFAULT_DB_PATH) -> Agent1State:
-    initial_state: Agent1State = {"ticket_id": ticket_id, "db_path": db_path, "agent_steps": []}
-    return app.invoke(initial_state)
+# ── Node 7: search_similar_tickets ───────────────────────────────────────────
+def node_search_similar(state: Agent1State) -> Agent1State:
+    matches = search_similar_tickets(
+        state["ticket"],
+        state.get("db_path", DEFAULT_DB_PATH),
+    )
+    state["similar_tickets"] = matches
+    pcts = [f"{m['similarity_percent']}%" for m in matches if "similarity_percent" in m]
+    return add_step(state,
+        f"RAG: retrieved {len(matches)} similar resolved tickets "
+        f"(similarities: {', '.join(pcts) or 'SQL fallback'})"
+    )
 
 
-# Graph initialization
-# Create a StateGraph that models the Agent 1 decision path.
+# ── Node 8: generate_reply ────────────────────────────────────────────────────
+def node_generate_reply(state: Agent1State) -> Agent1State:
+    reply = generate_reply(
+        state["ticket"],
+        state.get("order_details", {}),
+        state.get("similar_tickets", []),
+    )
+    state["suggested_reply"] = reply
+    return add_step(state, "Generated personalised RAG-grounded reply.")
+
+
+# ── Node 9: save_reply ────────────────────────────────────────────────────────
+# FIX P5: no auto-resolve logic here — that was moved to route_after_priority
+def node_save_reply(state: Agent1State) -> Agent1State:
+    ticket = state["ticket"]
+    reply  = state.get("suggested_reply", "")
+    reason = (
+        f"Suggested personalised reply grounded in {len(state.get('similar_tickets',[]))} "
+        f"similar resolved tickets via RAG."
+    )
+    state["decision"] = "suggest_reply"
+    state["reason"]   = reason
+    add_step(state, f"💬 DECISION: SUGGEST REPLY — {reason}")
+    save_suggested_reply(
+        ticket["ticket_id"], reply, reason,
+        state.get("agent_steps", []),
+        state.get("db_path", DEFAULT_DB_PATH),
+    )
+    return state
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Graph wiring
+# ═════════════════════════════════════════════════════════════════════════════
+
 graph = StateGraph(Agent1State)
 
+# Register nodes
+graph.add_node("load_ticket",          node_load_ticket)
+graph.add_node("customer_history",     node_customer_history)
+graph.add_node("order_details",        node_order_details)
+graph.add_node("check_incident",       node_check_incident)
+graph.add_node("calculate_priority",   node_calculate_priority)
+graph.add_node("search_similar",       node_search_similar)
+graph.add_node("generate_reply",       node_generate_reply)
+graph.add_node("save_reply",           node_save_reply)
+graph.add_node("escalate_ticket",      node_escalate_ticket)
+graph.add_node("auto_resolve_ticket",  node_auto_resolve)
 
-# Add nodes
-# Register each tool-backed step as a graph node.
-graph.add_node("load_ticket", node_load_ticket)
-graph.add_node("customer_history", node_customer_history)
-graph.add_node("order_details", node_order_details)
-graph.add_node("check_incident", node_check_incident)
-graph.add_node("calculate_priority", node_calculate_priority)
-graph.add_node("search_similar_tickets", node_search_similar)
-graph.add_node("generate_reply", node_generate_reply)
-graph.add_node("escalate_ticket", node_escalate_ticket)
-graph.add_node("finalize_reply", node_finalize_reply)
-
-
-# Add edges
-# Route high-risk tickets to escalation; route normal tickets through RAG reply generation.
+# Fixed edges (always happen)
 graph.set_entry_point("load_ticket")
-graph.add_edge("load_ticket", "customer_history")
+graph.add_edge("load_ticket",      "customer_history")
 graph.add_edge("customer_history", "order_details")
-graph.add_edge("order_details", "check_incident")
-graph.add_edge("check_incident", "calculate_priority")
+graph.add_edge("order_details",    "check_incident")
+
+# ── Branch A: after check_incident ───────────────────────────────────────────
+# Critical severity incident → skip priority → escalate immediately
+# Otherwise → run priority calculation
+graph.add_conditional_edges(
+    "check_incident",
+    route_after_incident,
+    {
+        "escalate_direct":    "escalate_ticket",   # critical incident bypass
+        "calculate_priority": "calculate_priority",
+    },
+)
+
+# ── Branch B: after calculate_priority (4-way) ───────────────────────────────
+# auto_resolve_direct → simple issue, template reply, no LLM
+# escalate_direct     → legal/security/VIP/high-value route
+# retrieve_similar    → normal RAG path
 graph.add_conditional_edges(
     "calculate_priority",
     route_after_priority,
-    {"escalate": "escalate_ticket", "retrieve": "search_similar_tickets"},
+    {
+        "auto_resolve_direct": "auto_resolve_ticket",
+        "escalate_direct":     "escalate_ticket",
+        "retrieve_similar":    "search_similar",
+    },
 )
-graph.add_edge("search_similar_tickets", "generate_reply")
-graph.add_edge("generate_reply", "finalize_reply")
-graph.add_edge("escalate_ticket", END)
-graph.add_edge("finalize_reply", END)
 
+# Normal RAG path
+graph.add_edge("search_similar",  "generate_reply")
+graph.add_edge("generate_reply",  "save_reply")
 
-# Compile graph
-# The compiled app can be imported by FastAPI or run directly from this file.
+# Terminal edges
+graph.add_edge("escalate_ticket",     END)
+graph.add_edge("auto_resolve_ticket", END)
+graph.add_edge("save_reply",          END)
+
+# Compile
 app = graph.compile()
 
 
-# Visualize graph using IPython display + Mermaid/PNG
-# Run this file directly or paste this block into a notebook to see the graph.
+# ═════════════════════════════════════════════════════════════════════════════
+# Public entry point
+# ═════════════════════════════════════════════════════════════════════════════
+
+def run_agent1_for_ticket(
+    ticket_id: str,
+    db_path:   str = DEFAULT_DB_PATH,
+) -> Agent1State:
+    initial: Agent1State = {
+        "ticket_id":   ticket_id,
+        "db_path":     db_path,
+        "agent_steps": [],
+    }
+    return app.invoke(initial)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CLI / notebook
+# ═════════════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    from IPython.display import Image, display
+    try:
+        from IPython.display import Image, display
+        display(Image(app.get_graph().draw_mermaid_png()))
+    except Exception:
+        print(app.get_graph().draw_mermaid())
 
-    display(Image(app.get_graph().draw_mermaid_png()))
-
-    # Invoke graph with sample input
-    # Change this ticket_id after seeding the database from dataset.csv.
-    sample_ticket_id = os.getenv("SAMPLE_TICKET_ID", "TKT-A9CCFC05")
-    final_state = run_agent1_for_ticket(sample_ticket_id, DEFAULT_DB_PATH)
-    print(json.dumps(final_state, indent=2, default=str))
+    sample_id = os.getenv("SAMPLE_TICKET_ID", "TKT-AC2AE5B0")
+    result    = run_agent1_for_ticket(sample_id, DEFAULT_DB_PATH)
+    print(json.dumps(result, indent=2, default=str))
