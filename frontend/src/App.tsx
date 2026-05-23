@@ -5,8 +5,10 @@ import { Layout } from '@/components/Layout'
 import { AgentsPage } from '@/pages/AgentsPage'
 import { DashboardPage } from '@/pages/DashboardPage'
 import { IncidentsPage } from '@/pages/IncidentsPage'
+import { MultilingualPage } from '@/pages/MultilingualPage'
 import { NewTicketPage } from '@/pages/NewTicketPage'
 import { RetentionPage } from '@/pages/RetentionPage'
+import { WeeklyReportPage } from '@/pages/WeeklyReportPage'
 import { SetupPage } from '@/pages/SetupPage'
 import { TicketDetailPage } from '@/pages/TicketDetailPage'
 import { TicketsPage } from '@/pages/TicketsPage'
@@ -30,6 +32,8 @@ export default function App() {
             <Route path="incidents" element={<IncidentsPage />} />
             <Route path="retention" element={<RetentionPage />} />
             <Route path="agents" element={<AgentsPage />} />
+            <Route path="reports" element={<WeeklyReportPage />} />
+            <Route path="multilingual" element={<MultilingualPage />} />
             <Route path="setup" element={<SetupPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>

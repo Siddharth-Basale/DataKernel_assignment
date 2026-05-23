@@ -425,6 +425,19 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weekly_reports (
+                report_id    TEXT PRIMARY KEY,
+                week_start   TEXT,
+                week_end     TEXT,
+                kpis         TEXT,
+                narrative    TEXT,
+                html_path    TEXT,
+                created_at   TEXT
+            )
+            """
+        )
         conn.commit()
 
 
@@ -1249,6 +1262,71 @@ def system_setup() -> Dict[str, Any]:
         "dataset_exists": Path(DATASET_PATH).exists(),
     }
 
+
+# ── Paste into main.py ──────────────────────────────────────────────────────
+
+from fastapi.responses import HTMLResponse
+from agent4_graph import run_weekly_report
+
+@app.post("/api/agents/weekly-report/run", tags=["Agent 4"])
+def trigger_weekly_report(week_start: Optional[str] = None) -> Dict[str, Any]:
+    state = run_weekly_report(DB_PATH, week_start=week_start)
+    return {
+        "report_id":   state.get("report_id"),
+        "week_start":  state.get("week_start"),
+        "week_end":    state.get("week_end"),
+        "report_path": state.get("report_path"),
+        "kpis":        state.get("kpis"),
+        "narrative":   state.get("narrative"),
+        "agent_steps": state.get("agent_steps"),
+    }
+
+@app.get("/api/agents/weekly-report/latest", response_class=HTMLResponse, tags=["Agent 4"])
+def get_latest_report():
+    init_db()
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT html_path FROM weekly_reports ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "No weekly report generated yet.")
+    with open(row["html_path"], encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
+
+@app.get("/api/agents/weekly-report/list", tags=["Agent 4"])
+def list_weekly_reports():
+    init_db()
+    with connect_db() as conn:
+        rows = conn.execute(
+            "SELECT report_id, week_start, week_end, created_at FROM weekly_reports ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+    return {"reports": [row_to_dict(r) for r in rows]}
+
+
+from agent5_graph import run_multilingual_agent, run_multilingual_batch, get_language_gap_report
+
+@app.post("/api/agents/multilingual/process/{ticket_id}", tags=["Agent 5"])
+def process_multilingual_ticket(ticket_id: str) -> Dict[str, Any]:
+    state = run_multilingual_agent(ticket_id, DB_PATH)
+    return {
+        "ticket_id":               state.get("ticket_id"),
+        "detected_language":       state.get("detected_language"),
+        "detected_language_name":  state.get("detected_language_name"),
+        "translation_skipped":     state.get("translation_skipped"),
+        "translated_category":     state.get("translated_category"),
+        "translated_sub_category": state.get("translated_sub_category"),
+        "localized_reply":         state.get("localized_reply"),
+        "agent_steps":             state.get("agent_steps"),
+        "error":                   state.get("error"),
+    }
+
+@app.post("/api/agents/multilingual/batch", tags=["Agent 5"])
+def batch_multilingual(language: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
+    return run_multilingual_batch(DB_PATH, language=language, limit=limit)
+
+@app.get("/api/agents/multilingual/stats", tags=["Agent 5"])
+def multilingual_stats() -> Dict[str, Any]:
+    return get_language_gap_report(DB_PATH)
 
 if __name__ == "__main__":
     import uvicorn

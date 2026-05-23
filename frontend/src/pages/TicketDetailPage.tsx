@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { RefreshCw } from 'lucide-react'
+import { Languages, RefreshCw } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
@@ -7,6 +7,7 @@ import {
   getCustomerTickets,
   getTicket,
   listSkuFlags,
+  processMultilingualTicket,
   runAgent1,
 } from '@/api'
 import { AgentResultPanel } from '@/components/AgentResultPanel'
@@ -53,6 +54,27 @@ export function TicketDetailPage() {
     queryFn: () => listSkuFlags(true),
   })
 
+  const isNonEnglish =
+    ticket?.language && ticket.language !== 'en' && ticket.language.trim() !== ''
+
+  const runMultilingual = useMutation({
+    mutationFn: () => processMultilingualTicket(id!),
+    onSuccess: (res) => {
+      setLastRun({
+        decision: res.translation_skipped ? 'english_pass_through' : 'multilingual',
+        reason: res.translation_skipped
+          ? 'Ticket is English — Agent 5 skipped translation.'
+          : `Localized reply in ${res.detected_language_name}`,
+        agent_steps: res.agent_steps,
+        suggested_reply: res.localized_reply,
+      })
+      setTab('response')
+      toast.success('Agent 5 completed')
+      qc.invalidateQueries({ queryKey: ['ticket', id] })
+    },
+    onError: (e: Error) => toast.error(e.message),
+  })
+
   const rerun = useMutation({
     mutationFn: () => runAgent1(id!),
     onSuccess: (data) => {
@@ -88,13 +110,28 @@ export function TicketDetailPage() {
           <div className="mt-2 flex flex-wrap gap-2">
             <Badge kind="status" value={ticket.resolution_status} />
             <Badge kind="tier" value={ticket.customer_tier} />
+            {ticket.language && ticket.language !== 'en' && (
+              <Badge kind="default" value={ticket.language} />
+            )}
             {displayDecision && <Badge kind="decision" value={displayDecision} />}
           </div>
         </div>
-        <Button variant="secondary" onClick={() => rerun.mutate()} disabled={rerun.isPending}>
-          <RefreshCw className={`h-4 w-4 ${rerun.isPending ? 'animate-spin' : ''}`} />
-          Re-run Agent 1
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          {isNonEnglish && (
+            <Button
+              variant="secondary"
+              onClick={() => runMultilingual.mutate()}
+              disabled={runMultilingual.isPending}
+            >
+              <Languages className={`h-4 w-4 ${runMultilingual.isPending ? 'animate-pulse' : ''}`} />
+              Run Agent 5
+            </Button>
+          )}
+          <Button variant="secondary" onClick={() => rerun.mutate()} disabled={rerun.isPending}>
+            <RefreshCw className={`h-4 w-4 ${rerun.isPending ? 'animate-spin' : ''}`} />
+            Re-run Agent 1
+          </Button>
+        </div>
       </div>
 
       {activeFlag && <SkuIncidentBanner flag={activeFlag} />}

@@ -3,7 +3,9 @@ import {
   AlertTriangle,
   Bot,
   Database,
+  FileText,
   Heart,
+  Languages,
   LayoutDashboard,
   Menu,
   Ticket,
@@ -20,6 +22,8 @@ const nav = [
   { to: '/tickets/new', label: 'New ticket', icon: Ticket },
   { to: '/incidents', label: 'Incidents', icon: AlertTriangle },
   { to: '/retention', label: 'Retention', icon: Heart },
+  { to: '/reports', label: 'Reports', icon: FileText },
+  { to: '/multilingual', label: 'Multilingual', icon: Languages },
   { to: '/agents', label: 'Agents', icon: Bot },
   { to: '/setup', label: 'Setup', icon: Database },
 ]

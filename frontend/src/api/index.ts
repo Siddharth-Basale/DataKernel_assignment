@@ -159,3 +159,80 @@ export async function listRetentionQueue(activeOnly = true, limit = 20) {
   )
   return data
 }
+
+export interface WeeklyReportMeta {
+  report_id: string
+  week_start: string
+  week_end: string
+  created_at: string
+}
+
+export async function runWeeklyReport(weekStart?: string) {
+  const { data } = await api.post<{
+    report_id: string
+    week_start: string
+    week_end: string
+    report_path: string
+    kpis: Record<string, unknown>
+    narrative: string
+    agent_steps: string[]
+  }>('/api/agents/weekly-report/run', null, {
+    params: weekStart ? { week_start: weekStart } : {},
+  })
+  return data
+}
+
+export async function listWeeklyReports() {
+  const { data } = await api.get<{ reports: WeeklyReportMeta[] }>(
+    '/api/agents/weekly-report/list',
+  )
+  return data
+}
+
+export async function getLatestWeeklyReportHtml() {
+  const { data } = await api.get<string>('/api/agents/weekly-report/latest', {
+    responseType: 'text',
+  })
+  return data
+}
+
+export async function processMultilingualTicket(ticketId: string) {
+  const { data } = await api.post<{
+    ticket_id: string
+    detected_language: string
+    detected_language_name: string
+    translation_skipped: boolean
+    translated_category?: string
+    translated_sub_category?: string
+    localized_reply?: string
+    agent_steps: string[]
+    error?: string
+  }>(`/api/agents/multilingual/process/${ticketId}`)
+  return data
+}
+
+export async function batchMultilingual(params?: { language?: string; limit?: number }) {
+  const { data } = await api.post<{
+    processed: number
+    skipped: number
+    errors: string[]
+    ticket_ids: string[]
+  }>('/api/agents/multilingual/batch', null, { params })
+  return data
+}
+
+export async function getMultilingualStats() {
+  const { data } = await api.get<{
+    language_distribution: {
+      language: string
+      total: number
+      has_reply: number
+      avg_sentiment: number
+    }[]
+    total_non_english_tickets: number
+    localized_replies_generated: number
+    coverage_pct: number
+    insight: string
+  }>('/api/agents/multilingual/stats')
+  return data
+}
