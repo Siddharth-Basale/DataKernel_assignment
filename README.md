@@ -1,6 +1,6 @@
 # Customer Support Insight Platform Documentation
 
-This project implements a local AI-powered customer support backend for the assignment dataset. The work completed here covers the FastAPI backend, SQLite storage, Chroma vector search, LangGraph Agent 1, and LangGraph Agent 2.
+This project implements a local AI-powered customer support backend for the assignment dataset. The work completed here covers the FastAPI backend, SQLite storage, Chroma vector search, LangGraph Agent 1, LangGraph Agent 2, and LangGraph Agent 3.
 
 ## What Was Built
 
@@ -9,9 +9,11 @@ This project implements a local AI-powered customer support backend for the assi
 - Local Chroma vector persistence in `chroma_store/`.
 - Agent 1 in `agent1_graph.py`.
 - Agent 2 in `agent2_graph.py`.
+- Agent 3 in `agent3_graph.py`.
 - Graph PNG exports:
   - `agent1_graph.png`
   - `agent2_graph.png`
+  - `agent3_graph.png`
 - OpenAPI/Swagger documentation with detailed schemas and examples.
 
 ## Data Flow
@@ -28,7 +30,13 @@ For anomaly detection:
 SQLite tickets -> Agent 2 volume scan -> z-score spike detection -> incident report -> incident table -> Agent 1 incident check
 ```
 
-Agent 1 and Agent 2 coordinate through the database. Agent 2 writes incidents and SKU flags. Agent 1 reads those incidents when deciding whether a new ticket should be escalated.
+For customer risk:
+
+```text
+SQLite tickets -> Agent 3 customer scan -> churn score -> lifetime value -> drafted retention offer -> retention queue
+```
+
+Agent 1 and Agent 2 coordinate through the database. Agent 2 writes incidents and SKU flags. Agent 1 reads those incidents when deciding whether a new ticket should be escalated. Agent 3 writes a separate retention queue for high-risk customers.
 
 ## Database
 
@@ -43,6 +51,10 @@ Agent 2 adds:
 
 - `incidents`
 - `sku_incident_flags`
+
+Agent 3 adds:
+
+- `retention_queue`
 
 ## API Endpoints
 
@@ -279,6 +291,98 @@ Returns:
 - sample ticket IDs
 - full report
 
+### `POST /agent3/run`
+
+Runs Agent 3 customer risk analysis.
+
+Agent 3 follows the implementation-plan churn/retention workflow.
+
+Query parameters:
+
+- `end_date`
+  - End date for the customer-risk scan.
+  - Default: `2025-01-31`
+- `lookback_days`
+  - Number of days before `end_date` to scan.
+  - Default: `90`
+- `min_ticket_count`
+  - Minimum number of tickets required for a customer to be considered high-contact.
+  - Default: `2`
+- `churn_threshold`
+  - Minimum churn score required for retention queue inclusion.
+  - Default: `3.0`
+- `max_customers`
+  - Maximum customers to write to the queue in one run.
+  - Default: `20`
+
+Agent 3 does:
+
+```text
+get high-contact customers
+load each customer profile
+compute churn score
+estimate recent lifetime value
+rank by churn_score * log(lifetime_value + 1)
+draft retention offer
+write retention queue row
+```
+
+The churn score uses the assignment formula:
+
+```text
+churn_score =
+  ticket_count * 0.30
+  + unresolved_count * 0.40
+  + is_repeat * 0.20
+  + tier_weight * 0.10
+```
+
+Tier weights:
+
+- `regular = 1.0`
+- `prime = 1.5`
+- `prime_plus = 2.0`
+
+In this implementation, `unresolved_count` means open-risk tickets:
+
+```text
+unresolved
+escalated
+pending
+```
+
+This makes the queue reflect unresolved customer pain, not only one exact status string.
+
+### `GET /agent3/retention-queue`
+
+Lists retention queue rows created by Agent 3.
+
+Query parameters:
+
+- `active_only`
+  - `true`: return only active queue rows.
+  - `false`: return all queue rows.
+- `limit`
+  - Maximum number of queue rows to return.
+
+Returns:
+
+- queue ID
+- customer ID
+- customer name
+- customer tier
+- country
+- language
+- ticket count
+- unresolved/open-risk ticket count
+- repeat-contact flag
+- top issue
+- churn score
+- lifetime value
+- retention priority
+- drafted retention offer
+- scan window
+
 ### `GET /insights`
 
 Returns dashboard-style aggregate metrics.
@@ -349,6 +453,36 @@ Agent 2 writes:
 
 Agent 1 then reads these incidents during escalation checks.
 
+## Agent 3
+
+Agent 3 is the customer risk agent.
+
+Its goal is to identify customers most likely to churn and prepare a retention queue.
+
+Agent 3 uses:
+
+- high-contact customer detection
+- full customer ticket history
+- churn score formula
+- recent lifetime value estimation
+- retention priority ranking
+- OpenAI/fallback offer drafting
+
+Agent 3 writes:
+
+- retention queue rows
+- personalized retention offers
+- churn score and lifetime value
+- customer risk context
+
+The queue is sorted by:
+
+```text
+retention_priority = churn_score * log(lifetime_value + 1)
+```
+
+This keeps high-value customers important without letting one very large order dominate the entire queue.
+
 ## Graph Images
 
 Agent 1 graph:
@@ -361,6 +495,12 @@ Agent 2 graph:
 
 ```text
 agent2_graph.png
+```
+
+Agent 3 graph:
+
+```text
+agent3_graph.png
 ```
 
 These diagrams visualize the LangGraph node flow for each agent.

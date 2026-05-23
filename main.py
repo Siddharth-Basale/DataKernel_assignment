@@ -274,6 +274,19 @@ class IncidentListResponse(BaseModel):
     items: List[Dict[str, Any]] = Field(..., description="Persisted incidents from SQLite.")
 
 
+class Agent3RunResponse(BaseModel):
+    retention_queue: List[Dict[str, Any]] = Field(..., description="Retention queue rows created or refreshed by Agent 3.")
+    agent_steps: List[str] = Field(..., description="Agent 3 progress log.")
+    selected_count: int = Field(..., description="Number of customers selected above churn threshold.")
+    window_start: str = Field(..., description="Start date of the customer-risk scan window.")
+    window_end: str = Field(..., description="End date of the customer-risk scan window.")
+
+
+class RetentionQueueResponse(BaseModel):
+    total: int = Field(..., description="Number of retention queue rows returned.")
+    items: List[Dict[str, Any]] = Field(..., description="Persisted retention queue rows from SQLite.")
+
+
 class CountItem(BaseModel):
     name: str = Field(..., description="Group name.")
     count: int = Field(..., description="Number of matching tickets.")
@@ -289,8 +302,8 @@ class InsightsResponse(BaseModel):
 
 
 app = FastAPI(
-    title="Customer Support Insight Platform - Agent 1 + Agent 2",
-    version="1.2.0",
+    title="Customer Support Insight Platform - Agent 1 + Agent 2 + Agent 3",
+    version="1.3.0",
     description=(
         "Local FastAPI backend for AI-powered customer support triage. "
         "Use `/tickets/draft` to enrich a minimal customer complaint, review the generated fields, "
@@ -302,6 +315,7 @@ app = FastAPI(
         {"name": "Tickets", "description": "Ticket listing, drafting, submission, and lookup."},
         {"name": "Agent 1", "description": "LangGraph ticket resolution agent: suggest reply, auto-resolve, or escalate."},
         {"name": "Agent 2", "description": "LangGraph anomaly investigation agent: detect spikes, create incidents, and flag SKUs."},
+        {"name": "Agent 3", "description": "LangGraph customer risk agent: score churn risk and draft retention offers."},
         {"name": "Insights", "description": "Dashboard-style aggregate metrics from SQLite."},
     ],
 )
@@ -363,6 +377,31 @@ def init_db() -> None:
                 severity TEXT,
                 active_incident INTEGER DEFAULT 1,
                 updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS retention_queue (
+                queue_id TEXT PRIMARY KEY,
+                customer_id TEXT,
+                customer_name TEXT,
+                customer_tier TEXT,
+                customer_country TEXT,
+                language TEXT,
+                ticket_count INTEGER,
+                unresolved_count INTEGER,
+                is_repeat INTEGER,
+                top_issue TEXT,
+                churn_score REAL,
+                lifetime_value REAL,
+                retention_priority REAL,
+                drafted_offer TEXT,
+                profile_json TEXT,
+                active INTEGER DEFAULT 1,
+                window_start TEXT,
+                window_end TEXT,
+                created_at TEXT
             )
             """
         )
@@ -475,6 +514,20 @@ def run_agent2(
     return run_agent2_investigation(DB_PATH, threshold, max_incidents, start_date, end_date)
 
 
+def run_agent3(
+    end_date: str,
+    lookback_days: int,
+    min_ticket_count: int,
+    churn_threshold: float,
+    max_customers: int,
+) -> Dict[str, Any]:
+    try:
+        from agent3_graph import run_agent3_customer_risk
+    except Exception as exc:
+        raise RuntimeError("Agent 3 dependencies are missing. Run: pip install -r requirements.txt") from exc
+    return run_agent3_customer_risk(DB_PATH, end_date, lookback_days, min_ticket_count, churn_threshold, max_customers)
+
+
 def build_submit_payload(draft: Dict[str, Any]) -> Dict[str, Any]:
     submit_fields = [
         "ticket_id",
@@ -520,6 +573,14 @@ def decode_incident_row(row: sqlite3.Row) -> Dict[str, Any]:
         else:
             data[field] = []
     data["active"] = bool(data.get("active"))
+    return data
+
+
+def decode_retention_row(row: sqlite3.Row) -> Dict[str, Any]:
+    data = row_to_dict(row)
+    data["is_repeat"] = bool(data.get("is_repeat"))
+    data["active"] = bool(data.get("active"))
+    data.pop("profile_json", None)
     return data
 
 
@@ -850,6 +911,66 @@ def list_agent2_incidents(
             (limit,),
         ).fetchall()
     items = [decode_incident_row(row) for row in rows]
+    return {"total": len(items), "items": items}
+
+
+@app.post(
+    "/agent3/run",
+    response_model=Agent3RunResponse,
+    tags=["Agent 3"],
+    summary="Run Agent 3 customer risk scan",
+    description=(
+        "Runs the Day-10 customer risk flow from the implementation plan. "
+        "It scans high-contact customers in a lookback window, computes churn risk, estimates recent lifetime value, "
+        "drafts personalized retention offers, and writes a prioritized retention queue."
+    ),
+)
+def run_agent3_endpoint(
+    end_date: Annotated[str, Query(description="End date for the customer-risk scan, YYYY-MM-DD. Defaults to seeded dataset end window.")] = "2025-01-31",
+    lookback_days: Annotated[int, Query(ge=1, le=365, description="How many days before end_date to scan.")] = 90,
+    min_ticket_count: Annotated[int, Query(ge=2, le=20, description="Minimum tickets in the window to consider a customer high-contact.")] = 2,
+    churn_threshold: Annotated[float, Query(description="Minimum churn score required for retention queue inclusion.")] = 3.0,
+    max_customers: Annotated[int, Query(ge=1, le=100, description="Maximum customers to write to the retention queue.")] = 20,
+) -> Dict[str, Any]:
+    init_db()
+    try:
+        state = run_agent3(end_date, lookback_days, min_ticket_count, churn_threshold, max_customers)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {
+        "retention_queue": state.get("retention_queue", []),
+        "agent_steps": state.get("agent_steps", []),
+        "selected_count": len(state.get("retention_queue", [])),
+        "window_start": state.get("start_date", ""),
+        "window_end": state.get("end_date", end_date),
+    }
+
+
+@app.get(
+    "/agent3/retention-queue",
+    response_model=RetentionQueueResponse,
+    tags=["Agent 3"],
+    summary="List Agent 3 retention queue",
+    description="Returns the prioritized retention queue written by Agent 3, sorted by retention priority.",
+)
+def list_agent3_retention_queue(
+    active_only: Annotated[bool, Query(description="If true, return only active queue rows.")] = True,
+    limit: Annotated[int, Query(ge=1, le=100, description="Maximum queue rows to return.")] = 20,
+) -> Dict[str, Any]:
+    init_db()
+    where_sql = "WHERE active = 1" if active_only else ""
+    with connect_db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM retention_queue
+            {where_sql}
+            ORDER BY retention_priority DESC, churn_score DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    items = [decode_retention_row(row) for row in rows]
     return {"total": len(items), "items": items}
 
 
