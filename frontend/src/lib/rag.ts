@@ -35,10 +35,17 @@ export function scoreRagExamples(examples: RagExample[]): (RagExample & {
     const normalized = normalizeRagExample(raw)
     const fromBackend = raw.similarity_percent
     const fromBatch = fallbackScores[index]
-    const similarity =
-      fromBackend != null && Number.isFinite(fromBackend)
-        ? Math.round(fromBackend)
-        : normalized.similarity ?? fromBatch ?? undefined
+    const fromNorm = normalized.similarity
+    let similarity: number | undefined
+    if (fromBackend != null && Number.isFinite(fromBackend) && fromBackend > 0) {
+      similarity = Math.round(fromBackend)
+    } else if (fromNorm != null && fromNorm > 0) {
+      similarity = fromNorm
+    } else if (fromBatch != null) {
+      similarity = fromBatch
+    } else if (fromBackend != null && Number.isFinite(fromBackend)) {
+      similarity = Math.round(fromBackend)
+    }
 
     return {
       ...normalized,

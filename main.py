@@ -53,7 +53,7 @@ CSV_COLUMNS = [
     "embedding_id",
 ]
 
-EXTRA_COLUMNS = ["agent_decision", "agent_reason", "agent_steps", "updated_at"]
+EXTRA_COLUMNS = ["agent_decision", "agent_reason", "agent_steps", "message_en", "updated_at"]
 
 NUMERIC_COLUMNS = {"order_value", "resolution_time_hrs", "sentiment_score", "urgency_score", "revenue_at_risk"}
 
@@ -438,6 +438,13 @@ def init_db() -> None:
             )
             """
         )
+        existing = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(tickets)").fetchall()
+        }
+        for column in EXTRA_COLUMNS:
+            if column not in existing:
+                conn.execute(f"ALTER TABLE tickets ADD COLUMN {column} TEXT")
         conn.commit()
 
 
@@ -765,13 +772,14 @@ def search_tickets(
             SELECT *
             FROM tickets
             WHERE ticket_id LIKE ?
+               OR customer_id LIKE ?
                OR customer_name LIKE ?
                OR message LIKE ?
                OR product_sku LIKE ?
             ORDER BY timestamp DESC
             LIMIT ?
             """,
-            (pattern, pattern, pattern, pattern, limit),
+            (pattern, pattern, pattern, pattern, pattern, limit),
         ).fetchall()
     items = [row_to_dict(row) for row in rows]
     return {"query": q, "total": len(items), "items": items}
@@ -1303,21 +1311,31 @@ def list_weekly_reports():
     return {"reports": [row_to_dict(r) for r in rows]}
 
 
-from agent5_graph import run_multilingual_agent, run_multilingual_batch, get_language_gap_report
+from agent1_graph import (
+    get_language_gap_report,
+    run_agent1_for_ticket,
+    run_multilingual_batch,
+)
 
-@app.post("/api/agents/multilingual/process/{ticket_id}", tags=["Agent 5"])
+@app.post("/api/agents/multilingual/process/{ticket_id}", tags=["Agent 1"])
 def process_multilingual_ticket(ticket_id: str) -> Dict[str, Any]:
-    state = run_multilingual_agent(ticket_id, DB_PATH)
+    """Alias for Agent 1 re-run (multilingual is built into the main graph)."""
+    init_db()
+    try:
+        state = run_agent1_for_ticket(ticket_id, DB_PATH)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {
-        "ticket_id":               state.get("ticket_id"),
-        "detected_language":       state.get("detected_language"),
-        "detected_language_name":  state.get("detected_language_name"),
-        "translation_skipped":     state.get("translation_skipped"),
-        "translated_category":     state.get("translated_category"),
-        "translated_sub_category": state.get("translated_sub_category"),
-        "localized_reply":         state.get("localized_reply"),
-        "agent_steps":             state.get("agent_steps"),
-        "error":                   state.get("error"),
+        "ticket_id": ticket_id,
+        "agent_state": state,
+        "detected_language": state.get("detected_language"),
+        "detected_language_name": state.get("detected_language_name"),
+        "translation_skipped": state.get("translation_skipped"),
+        "message_en": state.get("translated_message"),
+        "english_reply": state.get("english_reply"),
+        "localized_reply": state.get("localized_reply") or state.get("suggested_reply"),
+        "agent_steps": state.get("agent_steps"),
+        "error": state.get("error"),
     }
 
 @app.post("/api/agents/multilingual/batch", tags=["Agent 5"])

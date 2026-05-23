@@ -134,8 +134,9 @@ export function RetentionPage() {
                             Copy
                           </Button>
                           <Link
-                            to={`/tickets?search=${row.customer_id}`}
-                            className="text-sm text-brand-600 hover:underline self-center"
+                            to={`/tickets?customer_id=${encodeURIComponent(row.customer_id)}&customer_name=${encodeURIComponent(row.customer_name)}`}
+                            className="inline-flex items-center rounded-lg border border-brand-200 bg-white px-3 py-1.5 text-sm font-medium text-brand-700 hover:bg-brand-50"
+                            onClick={(e) => e.stopPropagation()}
                           >
                             View tickets
                           </Link>

@@ -1,15 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Languages, RefreshCw } from 'lucide-react'
+import { RefreshCw } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
-import {
-  getCustomerTickets,
-  getTicket,
-  listSkuFlags,
-  processMultilingualTicket,
-  runAgent1,
-} from '@/api'
+import { getCustomerTickets, getTicket, listSkuFlags, runAgent1 } from '@/api'
+import type { AgentState } from '@/types'
 import { AgentResultPanel } from '@/components/AgentResultPanel'
 import { AgentStepTimeline } from '@/components/AgentStepTimeline'
 import { SkuIncidentBanner } from '@/components/SkuIncidentBanner'
@@ -23,12 +18,7 @@ const tabs = ['response', 'overview', 'agent', 'history'] as const
 export function TicketDetailPage() {
   const { id } = useParams<{ id: string }>()
   const [tab, setTab] = useState<(typeof tabs)[number]>('response')
-  const [lastRun, setLastRun] = useState<{
-    decision?: string
-    reason?: string
-    agent_steps?: unknown
-    suggested_reply?: string
-  } | null>(null)
+  const [lastRun, setLastRun] = useState<AgentState | null>(null)
   const qc = useQueryClient()
 
   const { data: ticket, isLoading } = useQuery({
@@ -54,27 +44,6 @@ export function TicketDetailPage() {
     queryFn: () => listSkuFlags(true),
   })
 
-  const isNonEnglish =
-    ticket?.language && ticket.language !== 'en' && ticket.language.trim() !== ''
-
-  const runMultilingual = useMutation({
-    mutationFn: () => processMultilingualTicket(id!),
-    onSuccess: (res) => {
-      setLastRun({
-        decision: res.translation_skipped ? 'english_pass_through' : 'multilingual',
-        reason: res.translation_skipped
-          ? 'Ticket is English — Agent 5 skipped translation.'
-          : `Localized reply in ${res.detected_language_name}`,
-        agent_steps: res.agent_steps,
-        suggested_reply: res.localized_reply,
-      })
-      setTab('response')
-      toast.success('Agent 5 completed')
-      qc.invalidateQueries({ queryKey: ['ticket', id] })
-    },
-    onError: (e: Error) => toast.error(e.message),
-  })
-
   const rerun = useMutation({
     mutationFn: () => runAgent1(id!),
     onSuccess: (data) => {
@@ -90,14 +59,29 @@ export function TicketDetailPage() {
   const entities = parseJsonArray<string>(ticket?.key_entities)
   const steps = parseAgentSteps(lastRun?.agent_steps ?? ticket?.agent_steps)
 
+  const agentState = lastRun
   const displayReply =
-    lastRun?.suggested_reply ?? ticket?.suggested_reply ?? ticket?.agent_reply
-  const displayDecision = lastRun?.decision ?? ticket?.agent_decision
-  const displayReason = lastRun?.reason ?? ticket?.agent_reason
+    agentState?.localized_reply ??
+    agentState?.suggested_reply ??
+    ticket?.suggested_reply ??
+    ticket?.agent_reply
+  const displayDecision = agentState?.decision ?? ticket?.agent_decision
+  const displayReason = agentState?.reason ?? ticket?.agent_reason
+  const messageEn = agentState?.translated_message ?? ticket?.message_en
+  const englishReply = agentState?.english_reply
+  const languageName = agentState?.detected_language_name
 
   if (isLoading || !ticket) {
     return <div className="h-64 animate-pulse rounded-xl bg-slate-100" />
   }
+
+  const messageText = ticket.message?.trim() ?? ''
+  const summaryText = ticket.summary?.trim() ?? ''
+  const showSummary =
+    summaryText.length > 0 &&
+    summaryText !== messageText &&
+    !messageText.includes(summaryText) &&
+    !summaryText.includes(messageText)
 
   return (
     <div className="space-y-6">
@@ -116,22 +100,10 @@ export function TicketDetailPage() {
             {displayDecision && <Badge kind="decision" value={displayDecision} />}
           </div>
         </div>
-        <div className="flex flex-wrap gap-2">
-          {isNonEnglish && (
-            <Button
-              variant="secondary"
-              onClick={() => runMultilingual.mutate()}
-              disabled={runMultilingual.isPending}
-            >
-              <Languages className={`h-4 w-4 ${runMultilingual.isPending ? 'animate-pulse' : ''}`} />
-              Run Agent 5
-            </Button>
-          )}
-          <Button variant="secondary" onClick={() => rerun.mutate()} disabled={rerun.isPending}>
-            <RefreshCw className={`h-4 w-4 ${rerun.isPending ? 'animate-spin' : ''}`} />
-            Re-run Agent 1
-          </Button>
-        </div>
+        <Button variant="secondary" onClick={() => rerun.mutate()} disabled={rerun.isPending}>
+          <RefreshCw className={`h-4 w-4 ${rerun.isPending ? 'animate-spin' : ''}`} />
+          Re-run Agent 1
+        </Button>
       </div>
 
       {activeFlag && <SkuIncidentBanner flag={activeFlag} />}
@@ -169,6 +141,9 @@ export function TicketDetailPage() {
           reason={displayReason}
           steps={steps}
           suggestedReply={displayReply}
+          messageEn={messageEn}
+          englishReply={englishReply}
+          languageName={languageName}
           resolutionStatus={ticket.resolution_status}
         />
       )}
@@ -180,8 +155,26 @@ export function TicketDetailPage() {
               <CardTitle>Customer message</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4 text-sm">
-              <p className="whitespace-pre-wrap text-slate-700">{ticket.message}</p>
-              <p className="text-slate-500">{ticket.summary}</p>
+              {messageText ? (
+                <p className="whitespace-pre-wrap text-slate-700">{ticket.message}</p>
+              ) : (
+                <p className="text-slate-400">No message on file.</p>
+              )}
+              {ticket.message_en?.trim() &&
+                ticket.message_en.trim() !== messageText && (
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                    <p className="mb-1 text-xs font-semibold uppercase text-slate-500">
+                      English translation
+                    </p>
+                    <p className="whitespace-pre-wrap text-slate-700">{ticket.message_en}</p>
+                  </div>
+                )}
+              {showSummary && (
+                <div className="rounded-lg border border-slate-100 bg-slate-50/80 p-3">
+                  <p className="mb-1 text-xs font-semibold uppercase text-slate-500">Summary</p>
+                  <p className="whitespace-pre-wrap text-slate-600">{ticket.summary}</p>
+                </div>
+              )}
               <div className="flex flex-wrap gap-2">
                 {entities.map((e) => (
                   <span key={e} className="rounded-full bg-slate-100 px-2 py-1 text-xs">

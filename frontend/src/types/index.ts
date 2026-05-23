@@ -13,6 +13,7 @@ export interface Ticket {
   order_date?: string
   order_value?: number
   message?: string
+  message_en?: string
   agent_reply?: string
   resolution_status?: string
   resolution_time_hrs?: number
@@ -77,6 +78,12 @@ export interface AgentState {
   suggested_reply?: string
   similar_tickets?: unknown[]
   ticket?: Ticket
+  detected_language?: string
+  detected_language_name?: string
+  translation_skipped?: boolean
+  translated_message?: string
+  english_reply?: string
+  localized_reply?: string
 }
 
 export interface TicketSubmitResponse {

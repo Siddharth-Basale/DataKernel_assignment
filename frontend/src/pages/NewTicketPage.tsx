@@ -350,8 +350,15 @@ export function NewTicketPage() {
             reason={result.agent_state.reason}
             steps={result.agent_state.agent_steps}
             suggestedReply={
-              result.stored_ticket.suggested_reply ?? result.agent_state.suggested_reply
+              result.agent_state.localized_reply ??
+              result.stored_ticket.suggested_reply ??
+              result.agent_state.suggested_reply
             }
+            messageEn={
+              result.agent_state.translated_message ?? result.stored_ticket.message_en
+            }
+            englishReply={result.agent_state.english_reply}
+            languageName={result.agent_state.detected_language_name}
             resolutionStatus={result.stored_ticket.resolution_status}
             title="Agent 1 finished"
           />

@@ -81,9 +81,10 @@ export async function getTicket(ticketId: string): Promise<Ticket> {
   return data
 }
 
-export async function getCustomerTickets(customerId: string) {
+export async function getCustomerTickets(customerId: string, limit = 50) {
   const { data } = await api.get<{ customer_id: string; total: number; items: Ticket[] }>(
-    `/customers/${customerId}/tickets`,
+    `/customers/${encodeURIComponent(customerId)}/tickets`,
+    { params: { limit } },
   )
   return data
 }
@@ -199,13 +200,14 @@ export async function getLatestWeeklyReportHtml() {
 export async function processMultilingualTicket(ticketId: string) {
   const { data } = await api.post<{
     ticket_id: string
-    detected_language: string
-    detected_language_name: string
-    translation_skipped: boolean
-    translated_category?: string
-    translated_sub_category?: string
+    agent_state?: import('@/types').AgentState
+    detected_language?: string
+    detected_language_name?: string
+    translation_skipped?: boolean
+    message_en?: string
+    english_reply?: string
     localized_reply?: string
-    agent_steps: string[]
+    agent_steps?: string[]
     error?: string
   }>(`/api/agents/multilingual/process/${ticketId}`)
   return data

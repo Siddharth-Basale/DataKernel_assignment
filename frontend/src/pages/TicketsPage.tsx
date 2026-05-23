@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Plus, Search } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { getTicketFilters, listTickets, searchTickets } from '@/api'
+import { getCustomerTickets, getTicketFilters, listTickets, searchTickets } from '@/api'
 import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card'
@@ -20,13 +20,19 @@ const DEFAULT_FILTERS: TicketFilters = {
 
 export function TicketsPage() {
   const [params, setParams] = useSearchParams()
-  const [searchQ, setSearchQ] = useState(params.get('q') ?? '')
+  const [searchQ, setSearchQ] = useState(() => params.get('q') ?? '')
+  const customerId = params.get('customer_id') ?? ''
+  const customerName = params.get('customer_name') ?? ''
   const category = params.get('category') ?? ''
   const status = params.get('status') ?? ''
   const frustration = params.get('frustration') ?? ''
   const agentDecision = params.get('agent_decision') ?? ''
   const offset = Number(params.get('offset') ?? 0)
   const limit = 20
+
+  useEffect(() => {
+    setSearchQ(params.get('q') ?? '')
+  }, [params])
 
   const { data: filters } = useQuery({
     queryKey: ['ticket-filters'],
@@ -53,26 +59,46 @@ export function TicketsPage() {
   }, [searchQ, setParams])
 
   const q = params.get('q') ?? ''
-  const searching = q.length >= 2
+  const searching = !customerId && q.length >= 2
+  const customerFilter = Boolean(customerId)
 
   const { data, isLoading, isError, error } = useQuery({
-    queryKey: ['tickets', category, status, frustration, agentDecision, offset, q],
-    queryFn: () =>
-      searching
-        ? searchTickets(q, limit).then((r) => ({
-            total: r.total,
-            limit,
-            offset: 0,
-            items: r.items,
-          }))
-        : listTickets({
-            limit,
-            offset,
-            category: category || undefined,
-            status: status || undefined,
-            frustration: frustration || undefined,
-            agent_decision: agentDecision || undefined,
-          }),
+    queryKey: [
+      'tickets',
+      customerId,
+      category,
+      status,
+      frustration,
+      agentDecision,
+      offset,
+      q,
+    ],
+    queryFn: () => {
+      if (customerId) {
+        return getCustomerTickets(customerId, 100).then((r) => ({
+          total: r.total,
+          limit: r.total,
+          offset: 0,
+          items: r.items,
+        }))
+      }
+      if (searching) {
+        return searchTickets(q, limit).then((r) => ({
+          total: r.total,
+          limit,
+          offset: 0,
+          items: r.items,
+        }))
+      }
+      return listTickets({
+        limit,
+        offset,
+        category: category || undefined,
+        status: status || undefined,
+        frustration: frustration || undefined,
+        agent_decision: agentDecision || undefined,
+      })
+    },
   })
 
   const setFilter = (key: string, value: string) => {
@@ -88,13 +114,22 @@ export function TicketsPage() {
     setParams({})
   }
 
+  const clearCustomerFilter = () => {
+    const next = new URLSearchParams(params)
+    next.delete('customer_id')
+    next.delete('customer_name')
+    setParams(next)
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold">Ticket queue</h1>
           <p className="text-slate-500">
-            {data?.total?.toLocaleString() ?? 0} matching tickets
+            {customerFilter
+              ? `Tickets for ${customerName || 'this customer'}`
+              : `${data?.total?.toLocaleString() ?? 0} matching tickets`}
             {isError && (
               <span className="ml-2 text-red-600">· {(error as Error).message}</span>
             )}
@@ -107,6 +142,20 @@ export function TicketsPage() {
           </Button>
         </Link>
       </div>
+
+      {customerFilter && (
+        <Card className="border-brand-200 bg-brand-50/50">
+          <CardContent className="flex flex-wrap items-center justify-between gap-3 py-4 text-sm">
+            <p>
+              Showing <strong>{data?.total ?? 0}</strong> ticket(s) for{' '}
+              <strong>{customerName || customerId}</strong>
+            </p>
+            <Button variant="secondary" onClick={clearCustomerFilter}>
+              Show all tickets
+            </Button>
+          </CardContent>
+        </Card>
+      )}
 
       <Card>
         <CardContent className="space-y-3 pt-5">
@@ -168,7 +217,12 @@ export function TicketsPage() {
                 </option>
               ))}
             </select>
-            {(category || status || frustration || agentDecision || q) && (
+            {(category ||
+              status ||
+              frustration ||
+              agentDecision ||
+              q ||
+              customerFilter) && (
               <Button variant="ghost" onClick={clearFilters}>
                 Clear filters
               </Button>
@@ -252,7 +306,7 @@ export function TicketsPage() {
             </tbody>
           </table>
         </CardContent>
-        {!searching && (data?.total ?? 0) > limit && (
+        {!searching && !customerFilter && (data?.total ?? 0) > limit && (
           <div className="flex justify-between border-t border-slate-100 px-5 py-3">
             <Button
               variant="secondary"

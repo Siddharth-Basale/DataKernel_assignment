@@ -1,16 +1,18 @@
 import { AgentGraphCard, type AgentCardConfig } from '@/components/AgentGraphCard'
 import { Card, CardContent } from '@/components/ui/Card'
+import { Link } from 'react-router-dom'
 
 const AGENTS: AgentCardConfig[] = [
   {
     id: 1,
     title: 'Agent 1 — Ticket resolution',
     when: 'Every new ticket after draft review (POST /tickets/submit)',
-    desc: 'Priority scoring · incident check · RAG reply · auto-resolve or escalate',
+    desc: 'Translate non-English messages · priority · incidents · RAG · localized reply (hi/ta/te/bn)',
     graph: '/agent1_graph.png',
     href: '/tickets/new',
     linkLabel: 'Submit a ticket →',
-    trigger: 'Branches: escalate_direct · auto_resolve_direct · retrieve_similar → generate_reply',
+    trigger:
+      'prepare_language → check_incident → calculate_priority → escalate / auto-resolve / RAG → localized save',
   },
   {
     id: 2,
@@ -39,16 +41,6 @@ const AGENTS: AgentCardConfig[] = [
     href: '/reports',
     linkLabel: 'Generate & view reports →',
   },
-  {
-    id: 5,
-    title: 'Agent 5 — Multilingual routing',
-    when: 'Non-English tickets (hi, ta, te, bn, …) after ingest or on demand',
-    desc: 'Translate message → re-classify in English → localized reply in customer language',
-    graph: '/agent5_graph.png',
-    href: '/multilingual',
-    linkLabel: 'Language gap & batch process →',
-    trigger: 'Closes the 18% satisfaction gap for regional-language customers',
-  },
 ]
 
 export function AgentsPage() {
@@ -57,8 +49,8 @@ export function AgentsPage() {
       <div>
         <h1 className="text-2xl font-semibold">Agent control center</h1>
         <p className="text-slate-500">
-          Five LangGraph agents — ticket flow, anomalies, retention, leadership reports, and
-          multilingual support
+          Four LangGraph agents — ticket flow (with built-in multilingual), anomalies, retention,
+          and leadership reports
         </p>
       </div>
 
@@ -67,12 +59,20 @@ export function AgentsPage() {
           <p>
             <strong>Cross-agent flow:</strong> Agent 2 flags SKUs → Agent 1 escalates matching
             tickets. Agent 3 builds the retention queue. Agent 4 reads incidents + churn for the
-            weekly report. Agent 5 runs when <code className="rounded bg-white px-1">language ≠ en</code>{' '}
-            so replies match the customer&apos;s language.
+            weekly report.
+          </p>
+          <p>
+            <strong>Multilingual:</strong> When{' '}
+            <code className="rounded bg-white px-1">language ≠ en</code>, Agent 1 translates the
+            message to English for RAG, then saves a localized reply (e.g. Hindi) plus{' '}
+            <code className="rounded bg-white px-1">message_en</code> on the ticket. See{' '}
+            <Link to="/multilingual" className="text-brand-600 hover:underline">
+              Language coverage
+            </Link>{' '}
+            for stats and batch re-processing.
           </p>
           <p className="text-slate-600">
-            Tap any graph thumbnail to open a full-size view. Agent 1 graph reflects the updated
-            branch: check_incident → calculate_priority → escalate / auto-resolve / RAG reply path.
+            Tap any graph thumbnail to open a full-size view.
           </p>
         </CardContent>
       </Card>

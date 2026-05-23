@@ -3,11 +3,7 @@ import { Languages, Play } from 'lucide-react'
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
-import {
-  batchMultilingual,
-  getMultilingualStats,
-  processMultilingualTicket,
-} from '@/api'
+import { batchMultilingual, getMultilingualStats, processMultilingualTicket } from '@/api'
 import { AgentStepTimeline } from '@/components/AgentStepTimeline'
 import { AgentResultPanel } from '@/components/AgentResultPanel'
 import { Button } from '@/components/ui/Button'
@@ -34,10 +30,11 @@ export function MultilingualPage() {
       setLastResult(res)
       toast.success(
         res.translation_skipped
-          ? 'Ticket is English — no translation needed'
-          : `Processed in ${res.detected_language_name}`,
+          ? 'Ticket is English — no localization needed'
+          : `Agent 1 completed (${res.detected_language_name})`,
       )
       qc.invalidateQueries({ queryKey: ['multilingual-stats'] })
+      qc.invalidateQueries({ queryKey: ['ticket', ticketId.trim()] })
     },
     onError: (e: Error) => toast.error(e.message),
   })
@@ -60,27 +57,31 @@ export function MultilingualPage() {
       count: row.total,
     })) ?? []
 
+  const agentState = lastResult?.agent_state
+  const steps = lastResult?.agent_steps ?? agentState?.agent_steps
+
   return (
     <div className="space-y-8">
       <div>
-        <h1 className="text-2xl font-semibold">Multilingual support</h1>
+        <h1 className="text-2xl font-semibold">Language coverage</h1>
         <p className="text-slate-500">
-          Agent 5 — translate, re-classify, and reply in the customer&apos;s language
+          Multilingual routing is built into Agent 1 — translate, RAG, and localized replies
         </p>
       </div>
 
       <Card>
         <CardHeader>
-          <CardTitle>When Agent 5 runs</CardTitle>
+          <CardTitle>How it works</CardTitle>
         </CardHeader>
         <CardContent className="space-y-2 text-sm text-slate-600">
           <p>
-            Triggered for tickets where <strong>language is not English</strong> (hi, ta, te, bn,
-            etc.) — about 25% of Indian customers in the dataset. It translates the message to
-            English for AI/RAG, re-classifies, generates a reply, then localizes the reply back.
+            On every submit or re-run, Agent 1 detects non-English tickets (hi, ta, te, bn, etc.),
+            translates the customer message to English for processing, runs the full resolution
+            graph, then saves a localized reply plus <strong>message_en</strong> on the ticket.
           </p>
           <p>
-            English tickets skip translation and pass through to Agent 1 as usual.
+            Use this page for coverage stats and to batch re-run Agent 1 on existing non-English
+            tickets.
           </p>
         </CardContent>
       </Card>
@@ -132,7 +133,7 @@ export function MultilingualPage() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Languages className="h-5 w-5" />
-            Process one ticket
+            Re-run Agent 1 on one ticket
           </CardTitle>
         </CardHeader>
         <CardContent className="flex flex-wrap items-end gap-3">
@@ -149,7 +150,7 @@ export function MultilingualPage() {
             onClick={() => processOne.mutate()}
             disabled={!ticketId.trim() || processOne.isPending}
           >
-            {processOne.isPending ? 'Processing…' : 'Run Agent 5'}
+            {processOne.isPending ? 'Processing…' : 'Re-run Agent 1'}
           </Button>
         </CardContent>
       </Card>
@@ -157,24 +158,27 @@ export function MultilingualPage() {
       {lastResult && !lastResult.translation_skipped && (
         <AgentResultPanel
           title={`Localized reply (${lastResult.detected_language_name})`}
-          suggestedReply={lastResult.localized_reply}
-          decision="multilingual"
-          reason={`Re-classified as ${lastResult.translated_category} / ${lastResult.translated_sub_category}`}
-          steps={lastResult.agent_steps}
+          suggestedReply={lastResult.localized_reply ?? agentState?.suggested_reply}
+          messageEn={lastResult.message_en ?? agentState?.translated_message}
+          englishReply={lastResult.english_reply ?? agentState?.english_reply}
+          languageName={lastResult.detected_language_name}
+          decision={agentState?.decision}
+          reason={agentState?.reason}
+          steps={steps}
         />
       )}
 
-      {lastResult?.agent_steps && lastResult.translation_skipped && (
+      {steps && lastResult?.translation_skipped && (
         <Card>
           <CardContent className="pt-5">
-            <AgentStepTimeline steps={lastResult.agent_steps} />
+            <AgentStepTimeline steps={steps} />
           </CardContent>
         </Card>
       )}
 
       <Card>
         <CardHeader>
-          <CardTitle>Batch process non-English backlog</CardTitle>
+          <CardTitle>Batch re-run Agent 1 (non-English backlog)</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-wrap gap-3">
           <select
@@ -190,17 +194,17 @@ export function MultilingualPage() {
           </select>
           <Button onClick={() => batch.mutate()} disabled={batch.isPending}>
             <Play className="h-4 w-4" />
-            {batch.isPending ? 'Running batch…' : 'Run batch (up to 50)'}
+            {batch.isPending ? 'Running batch…' : 'Re-run Agent 1 (up to 50)'}
           </Button>
         </CardContent>
       </Card>
 
       <p className="text-sm text-slate-500">
-        Tip: open a ticket with language ≠ en from the{' '}
+        Tip: open a non-English ticket from the{' '}
         <Link to="/tickets" className="text-brand-600 hover:underline">
           ticket queue
         </Link>{' '}
-        and run Agent 5 from the detail page.
+        and use Re-run Agent 1 on the detail page.
       </p>
     </div>
   )

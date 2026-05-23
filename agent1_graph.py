@@ -7,7 +7,7 @@ import sqlite3
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from dotenv import load_dotenv
 from langgraph.graph import END, StateGraph
@@ -23,6 +23,15 @@ except ImportError:
     ChatOpenAI = None
     OpenAIEmbeddings = None
 
+try:
+    from langdetect import detect as _langdetect
+    from langdetect import DetectorFactory
+
+    DetectorFactory.seed = 42
+    HAS_LANGDETECT = True
+except ImportError:
+    HAS_LANGDETECT = False
+
 
 load_dotenv()
 
@@ -32,6 +41,22 @@ COLLECTION_NAME    = "resolved_ticket_replies"
 CHROMA_DISTANCE    = "cosine"
 EMBEDDING_MODEL    = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 CHAT_MODEL         = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+LANGUAGE_NAMES: Dict[str, str] = {
+    "en": "English",
+    "hi": "Hindi",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "bn": "Bengali",
+    "ar": "Arabic",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "pt": "Portuguese",
+    "zh": "Chinese (Simplified)",
+    "ja": "Japanese",
+    "ko": "Korean",
+}
 
 # ── Taxonomy ──────────────────────────────────────────────────────────────────
 CATEGORY_SUBCATEGORIES: Dict[str, List[str]] = {
@@ -128,6 +153,16 @@ class Agent1State(TypedDict, total=False):
     agent_steps:      List[str]     # always a Python list; serialised on DB write
     classification_confidence: float  # NEW: LLM classification confidence 0-1
     error:            str
+    # Multilingual (merged from Agent 5)
+    detected_language:       str
+    detected_language_name:  str
+    original_message:        str
+    translated_message:      str
+    translated_category:     str
+    translated_sub_category: str
+    translation_skipped:     bool
+    english_reply:           str
+    localized_reply:         str
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -210,6 +245,203 @@ def get_chat_model() -> Any:
     return ChatOpenAI(model=CHAT_MODEL, temperature=0.2)
 
 
+# ── Multilingual helpers (merged from Agent 5) ────────────────────────────────
+
+def llm_detect_language(message: str) -> Tuple[str, str]:
+    if HAS_LANGDETECT and len(message) >= 20:
+        try:
+            code = _langdetect(message)
+            return code, LANGUAGE_NAMES.get(code, code.upper())
+        except Exception:
+            pass
+    if not os.getenv("OPENAI_API_KEY"):
+        return "en", "English"
+    prompt = (
+        f"Detect the language of this customer support message.\n"
+        f'Reply with ONLY JSON: {{"code": "hi", "name": "Hindi"}}\n'
+        f"Message: {message[:300]}"
+    )
+    try:
+        resp = get_chat_model().invoke(prompt)
+        content = resp.content.strip()
+        content = content[content.find("{") : content.rfind("}") + 1]
+        parsed = json.loads(content)
+        code = parsed.get("code", "en")
+        return code, parsed.get("name", LANGUAGE_NAMES.get(code, code.upper()))
+    except Exception:
+        return "en", "English"
+
+
+def llm_translate_to_english(message: str, source_language: str) -> str:
+    if not os.getenv("OPENAI_API_KEY"):
+        return message
+    prompt = (
+        f"Translate this customer support message from {source_language} to English.\n"
+        f"Preserve tone, urgency, and all details. Return ONLY the translation.\n\n"
+        f"Original:\n{message}"
+    )
+    try:
+        return get_chat_model().invoke(prompt).content.strip()
+    except Exception:
+        return message
+
+
+def llm_classify_english(english_message: str) -> Tuple[str, str]:
+    if not os.getenv("OPENAI_API_KEY"):
+        return "delivery", "not_delivered"
+    taxonomy_str = json.dumps(CATEGORY_SUBCATEGORIES, indent=2)
+    prompt = (
+        f"Classify into category and sub_category. Return ONLY JSON.\n"
+        f"Taxonomy:\n{taxonomy_str}\n\nMessage:\n{english_message[:500]}"
+    )
+    try:
+        resp = get_chat_model().invoke(prompt)
+        content = resp.content.strip()
+        content = content[content.find("{") : content.rfind("}") + 1]
+        parsed = json.loads(content)
+        cat = parsed.get("category", "delivery")
+        sub = parsed.get("sub_category", "not_delivered")
+        if cat not in CATEGORY_SUBCATEGORIES:
+            cat = "delivery"
+        if sub not in CATEGORY_SUBCATEGORIES.get(cat, []):
+            sub = CATEGORY_SUBCATEGORIES[cat][0]
+        return cat, sub
+    except Exception:
+        return "delivery", "not_delivered"
+
+
+def llm_translate_reply(english_reply: str, target_language_name: str) -> str:
+    if not os.getenv("OPENAI_API_KEY"):
+        return english_reply
+    prompt = (
+        f"Translate this support reply from English to {target_language_name}.\n"
+        f"Preserve professional, empathetic tone. Return ONLY the translation.\n\n"
+        f"{english_reply}"
+    )
+    try:
+        return get_chat_model().invoke(prompt).content.strip()
+    except Exception:
+        return english_reply
+
+
+def ensure_multilingual_table(db_path: str) -> None:
+    with connect_db(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS multilingual_log (
+                log_id              TEXT PRIMARY KEY,
+                ticket_id           TEXT,
+                detected_language   TEXT,
+                original_message    TEXT,
+                translated_message  TEXT,
+                localized_reply     TEXT,
+                processed_at        TEXT
+            )
+            """
+        )
+        conn.commit()
+
+
+def log_multilingual_run(state: Agent1State) -> None:
+    if state.get("translation_skipped"):
+        return
+    db_path = state.get("db_path", DEFAULT_DB_PATH)
+    ensure_multilingual_table(db_path)
+    with connect_db(db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO multilingual_log
+                (log_id, ticket_id, detected_language, original_message,
+                 translated_message, localized_reply, processed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ML-" + uuid.uuid4().hex[:8].upper(),
+                state["ticket_id"],
+                state.get("detected_language", "en"),
+                (state.get("original_message") or "")[:500],
+                (state.get("translated_message") or "")[:500],
+                (state.get("localized_reply") or "")[:500],
+                datetime.utcnow().isoformat(timespec="seconds"),
+            ),
+        )
+        conn.commit()
+
+
+def multilingual_key_entities(state: Agent1State) -> List[str]:
+    ticket = state.get("ticket", {})
+    entities = _safe_load_json_list(ticket.get("key_entities"))
+    if not isinstance(entities, list):
+        entities = []
+    tag = f"[multilingual] detected={state.get('detected_language_name', '?')}"
+    if tag not in entities:
+        entities.append(tag)
+    return entities
+
+
+def persist_multilingual_fields(state: Agent1State) -> None:
+    """Save message_en and reclassified category without a customer reply."""
+    if state.get("translation_skipped"):
+        return
+    updates: Dict[str, Any] = {"key_entities": multilingual_key_entities(state)}
+    if state.get("translated_message"):
+        updates["message_en"] = state["translated_message"]
+    if not state.get("translation_skipped"):
+        if state.get("translated_category"):
+            updates["category"] = state["translated_category"]
+        if state.get("translated_sub_category"):
+            updates["sub_category"] = state["translated_sub_category"]
+    if len(updates) > 1 or updates.get("message_en"):
+        update_ticket_fields(
+            state["ticket_id"], updates, state.get("db_path", DEFAULT_DB_PATH),
+        )
+
+
+def localize_outgoing_reply(state: Agent1State, english_reply: str) -> str:
+    state["english_reply"] = english_reply
+    if state.get("translation_skipped") or state.get("detected_language") == "en":
+        state["localized_reply"] = english_reply
+        return english_reply
+    localized = llm_translate_reply(
+        english_reply, state.get("detected_language_name", "English"),
+    )
+    state["localized_reply"] = localized
+    return localized
+
+
+def save_agent1_outcome(
+    ticket_id: str,
+    state: Agent1State,
+    *,
+    suggested_reply: str,
+    agent_decision: str,
+    agent_reason: str,
+    resolution_status: Optional[str] = None,
+    revenue_at_risk: Optional[float] = None,
+) -> None:
+    db_path = state.get("db_path", DEFAULT_DB_PATH)
+    updates: Dict[str, Any] = {
+        "suggested_reply": suggested_reply,
+        "agent_decision":  agent_decision,
+        "agent_reason":    agent_reason,
+        "agent_steps":     state.get("agent_steps", []),
+        "key_entities":    multilingual_key_entities(state),
+    }
+    if resolution_status:
+        updates["resolution_status"] = resolution_status
+    if revenue_at_risk is not None:
+        updates["revenue_at_risk"] = revenue_at_risk
+    if state.get("translated_message") and not state.get("translation_skipped"):
+        updates["message_en"] = state["translated_message"]
+    if not state.get("translation_skipped"):
+        if state.get("translated_category"):
+            updates["category"] = state["translated_category"]
+        if state.get("translated_sub_category"):
+            updates["sub_category"] = state["translated_sub_category"]
+    update_ticket_fields(ticket_id, updates, db_path)
+    log_multilingual_run(state)
+
+
 def get_embeddings_model() -> Any:
     if OpenAIEmbeddings is None:
         raise RuntimeError("langchain-openai not installed.")
@@ -228,14 +460,25 @@ def get_chroma_collection() -> Any:
 
 
 def distances_to_similarity_percent(distances: List[float]) -> List[int]:
+    """Map Chroma distances to 0–100 scores. Uses relative ranking when absolute cosine scores collapse to 0."""
     if not distances:
         return []
+
+    def _relative() -> List[int]:
+        mn, mx = min(distances), max(distances)
+        if mx <= mn:
+            return [100] * len(distances)
+        return [
+            max(0, min(100, round(100.0 * (1.0 - (d - mn) / (mx - mn)))))
+            for d in distances
+        ]
+
     if all(0.0 <= d <= 2.0 for d in distances):
-        return [max(0, min(100, round((1.0 - d) * 100))) for d in distances]
-    mn, mx = min(distances), max(distances)
-    if mx <= mn:
-        return [100] * len(distances)
-    return [max(0, min(100, round(100.0 * (1.0 - (d - mn) / (mx - mn))))) for d in distances]
+        absolute = [max(0, min(100, round((1.0 - d) * 100))) for d in distances]
+        if max(absolute) > 0:
+            return absolute
+        return _relative()
+    return _relative()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -356,13 +599,24 @@ def calculate_priority(
     priority_score = min(1.0, sentiment + tier_bonus + value_bonus + repeat_bonus
                          + status_bonus + history_bonus + incident_bonus)
 
+    sub = ticket.get("sub_category") or ""
+    incident_severity = (incident or {}).get("severity", "").lower()
+    # Active incidents raise priority but must not block simple auto-resolve templates.
+    incident_forces_escalate = bool(
+        incident
+        and incident_severity == "critical"
+        and sub not in AUTO_RESOLVE_SUBCATEGORIES
+    )
+
     auto_escalate = bool(
-        incident                                                      # Agent 2 flagged this SKU
-        or (priority_score > 0.85 and tier == "prime_plus")          # VIP + critical priority
-        or (order_value > 100_000 and tier in {"prime", "prime_plus"})  # high-value VIP order
-        or (order_value > 50_000
+        incident_forces_escalate
+        or (priority_score > 0.85 and tier == "prime_plus")
+        or (order_value > 100_000 and tier in {"prime", "prime_plus"})
+        or (
+            order_value > 50_000
             and ticket.get("frustration_level") == "critical"
-            and status != "resolved")                                 # large frustrated order
+            and status != "resolved"
+        )
     )
 
     return {
@@ -525,12 +779,13 @@ def _fallback_similar_tickets(sub_category: str, db_path: str) -> List[Dict[str,
 
 
 def search_similar_tickets(
-    ticket:    Dict[str, Any],
-    db_path:   str = DEFAULT_DB_PATH,
-    n_results: int = 3,
+    ticket:         Dict[str, Any],
+    db_path:        str = DEFAULT_DB_PATH,
+    n_results:      int = 3,
+    query_message:  Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     sub_category = ticket.get("sub_category") or ""
-    message      = ticket.get("message") or ""
+    message      = query_message or ticket.get("message") or ""
     if not sub_category or not message:
         return []
 
@@ -587,6 +842,7 @@ def search_classification_examples(message: str, limit: int = 5) -> List[Dict[st
                 "sub_category":      meta.get("sub_category"),
                 "text":              result.get("documents", [[]])[0][i],
                 "agent_reply":       meta.get("agent_reply"),
+                "distance":          distances[i],
                 "similarity_percent":similarities[i],
             }
             for i, meta in enumerate(result.get("metadatas", [[]])[0])
@@ -741,6 +997,17 @@ def count_previous_customer_tickets(
         return 0
 
 
+def _message_for_rag_and_classify(raw_ticket: Dict[str, Any]) -> Tuple[str, str]:
+    """Return (message_for_llm, message_for_embedding). Non-English → English for RAG."""
+    message = raw_ticket.get("message") or ""
+    lang = (raw_ticket.get("language") or "").strip().lower()
+    if lang and lang != "en":
+        lang_name = LANGUAGE_NAMES.get(lang, lang.upper())
+        english = llm_translate_to_english(message, lang_name)
+        return english, english
+    return message, message
+
+
 def draft_ticket_fields(
     raw_ticket: Dict[str, Any],
     db_path:    str = DEFAULT_DB_PATH,
@@ -750,9 +1017,9 @@ def draft_ticket_fields(
     customer_id   = raw_ticket.get("customer_id")
     is_repeat     = count_previous_customer_tickets(customer_id, db_path) > 0
 
-    # P4 FIX: Pull RAG examples first, pass as few-shot to LLM classifier
-    rag_examples   = search_classification_examples(message)
-    classification = classify_ticket_with_llm(message, rag_examples)
+    classify_msg, rag_query = _message_for_rag_and_classify(raw_ticket)
+    rag_examples   = search_classification_examples(rag_query)
+    classification = classify_ticket_with_llm(classify_msg, rag_examples)
 
     resolution_status = "pending"
     scores = calculate_enrichment_scores(
@@ -911,7 +1178,11 @@ def add_step(state: Agent1State, message: str) -> Agent1State:
     steps = _safe_load_json_list(state.get("agent_steps", []))
     steps.append(message)
     state["agent_steps"] = steps
-    print(f"[Agent 1] {message}")
+    line = f"[Agent 1] {message}"
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        print(line.encode("ascii", "replace").decode("ascii"))
     return state
 
 
@@ -936,6 +1207,58 @@ def node_load_ticket(state: Agent1State) -> Agent1State:
         f"tier={ticket.get('customer_tier')} | "
         f"order_value=₹{ticket.get('order_value')} | "
         f"entities={state['key_entities']}"
+    )
+
+
+def node_prepare_language(state: Agent1State) -> Agent1State:
+    """Detect language, translate to English for processing, reclassify if needed."""
+    ticket = state["ticket"]
+    message = ticket.get("message") or ""
+    state["original_message"] = message
+
+    declared = (ticket.get("language") or "").strip().lower()
+    if declared and declared != "en" and len(declared) == 2:
+        code, name = declared, LANGUAGE_NAMES.get(declared, declared.upper())
+        source = "declared in ticket"
+    else:
+        code, name = llm_detect_language(message)
+        source = "auto-detected"
+
+    state["detected_language"] = code
+    state["detected_language_name"] = name
+
+    if code == "en":
+        state["translation_skipped"] = True
+        state["translated_message"] = message
+        state["translated_category"] = ticket.get("category", "")
+        state["translated_sub_category"] = ticket.get("sub_category", "")
+        return add_step(state, f"Language {source}: English — processing in original language.")
+
+    state["translation_skipped"] = False
+    translated = llm_translate_to_english(message, name)
+    state["translated_message"] = translated
+
+    orig_cat = ticket.get("category")
+    orig_sub = ticket.get("sub_category")
+    cat, sub = llm_classify_english(translated)
+    state["translated_category"] = cat
+    state["translated_sub_category"] = sub
+
+    ticket = dict(ticket)
+    ticket["message"] = translated
+    ticket["category"] = cat
+    ticket["sub_category"] = sub
+    state["ticket"] = ticket
+
+    reclass_note = (
+        f" Re-classified: {orig_cat}/{orig_sub} -> {cat}/{sub}."
+        if cat != orig_cat or sub != orig_sub
+        else f" Classification confirmed: {cat}/{sub}."
+    )
+    preview = translated[:100].replace("\n", " ")
+    return add_step(
+        state,
+        f"Language {source}: {name} ({code}). Translated for processing: \"{preview}…\".{reclass_note}",
     )
 
 
@@ -983,12 +1306,10 @@ def node_check_incident(state: Agent1State) -> Agent1State:
     return add_step(state, "No active Agent-2 incident for this SKU/category.")
 
 
-# ── Route A: after check_incident — fast-exit for critical incidents ──────────
-# FIX P1 (first branch): critical severity incidents skip priority calculation
+# ── Route A: after check_incident ─────────────────────────────────────────────
+# Always run priority — routing happens in route_after_priority so simple issues
+# (cant_login, etc.) can still auto-resolve during a category-wide incident.
 def route_after_incident(state: Agent1State) -> str:
-    incident = state.get("active_incident")
-    if incident and incident.get("severity") == "critical":
-        return "escalate_direct"   # skip priority calc — critical incident → always escalate
     return "calculate_priority"
 
 
@@ -1061,6 +1382,7 @@ def node_escalate_ticket(state: Agent1State) -> Agent1State:
     state["decision"] = "escalate"
     state["reason"]   = reason
     add_step(state, f"🔺 DECISION: ESCALATE — {reason}")
+    persist_multilingual_fields(state)
     escalate_to_human(
         ticket["ticket_id"], reason,
         state.get("agent_steps", []),
@@ -1075,27 +1397,40 @@ def node_auto_resolve(state: Agent1State) -> Agent1State:
     ticket = state["ticket"]
     sub    = ticket.get("sub_category", "cant_login")
     name   = ticket.get("customer_name", "there")
-    reply  = AUTO_RESOLVE_REPLIES.get(sub, AUTO_RESOLVE_REPLIES["cant_login"])
-    reply  = reply.format(name=name.split()[0])
-    reason = f"Auto-resolved '{sub}' — standard guidance reply issued. No LLM tokens used."
+    english = AUTO_RESOLVE_REPLIES.get(sub, AUTO_RESOLVE_REPLIES["cant_login"])
+    english = english.format(name=name.split()[0])
+    reason = f"Auto-resolved '{sub}' — standard guidance reply issued."
 
-    state["suggested_reply"] = reply
+    localized = localize_outgoing_reply(state, english)
+    if not state.get("translation_skipped"):
+        add_step(
+            state,
+            f"Localized auto-resolve reply to {state.get('detected_language_name', '?')}.",
+        )
+
+    state["suggested_reply"] = localized
     state["decision"]        = "auto_resolve"
     state["reason"]          = reason
     add_step(state, f"✅ DECISION: AUTO-RESOLVE — {sub}")
-    auto_resolve(
-        ticket["ticket_id"], reply, reason,
-        state.get("agent_steps", []),
-        state.get("db_path", DEFAULT_DB_PATH),
+    save_agent1_outcome(
+        ticket["ticket_id"],
+        state,
+        suggested_reply=localized,
+        agent_decision="auto_resolve",
+        agent_reason=reason,
+        resolution_status="resolved",
+        revenue_at_risk=0.0,
     )
     return state
 
 
 # ── Node 7: search_similar_tickets ───────────────────────────────────────────
 def node_search_similar(state: Agent1State) -> Agent1State:
+    query_msg = state.get("translated_message") or state["ticket"].get("message")
     matches = search_similar_tickets(
         state["ticket"],
         state.get("db_path", DEFAULT_DB_PATH),
+        query_message=query_msg,
     )
     state["similar_tickets"] = matches
     pcts = [f"{m['similarity_percent']}%" for m in matches if "similarity_percent" in m]
@@ -1107,13 +1442,18 @@ def node_search_similar(state: Agent1State) -> Agent1State:
 
 # ── Node 8: generate_reply ────────────────────────────────────────────────────
 def node_generate_reply(state: Agent1State) -> Agent1State:
-    reply = generate_reply(
+    english = generate_reply(
         state["ticket"],
         state.get("order_details", {}),
         state.get("similar_tickets", []),
     )
-    state["suggested_reply"] = reply
-    return add_step(state, "Generated personalised RAG-grounded reply.")
+    state["english_reply"] = english
+    localized = localize_outgoing_reply(state, english)
+    state["suggested_reply"] = localized
+    step = "Generated personalised RAG-grounded reply."
+    if not state.get("translation_skipped"):
+        step += f" Localized to {state.get('detected_language_name', '?')}."
+    return add_step(state, step)
 
 
 # ── Node 9: save_reply ────────────────────────────────────────────────────────
@@ -1128,10 +1468,12 @@ def node_save_reply(state: Agent1State) -> Agent1State:
     state["decision"] = "suggest_reply"
     state["reason"]   = reason
     add_step(state, f"💬 DECISION: SUGGEST REPLY — {reason}")
-    save_suggested_reply(
-        ticket["ticket_id"], reply, reason,
-        state.get("agent_steps", []),
-        state.get("db_path", DEFAULT_DB_PATH),
+    save_agent1_outcome(
+        ticket["ticket_id"],
+        state,
+        suggested_reply=reply,
+        agent_decision="suggest_reply",
+        agent_reason=reason,
     )
     return state
 
@@ -1144,6 +1486,7 @@ graph = StateGraph(Agent1State)
 
 # Register nodes
 graph.add_node("load_ticket",          node_load_ticket)
+graph.add_node("prepare_language",     node_prepare_language)
 graph.add_node("customer_history",     node_customer_history)
 graph.add_node("order_details",        node_order_details)
 graph.add_node("check_incident",       node_check_incident)
@@ -1156,7 +1499,8 @@ graph.add_node("auto_resolve_ticket",  node_auto_resolve)
 
 # Fixed edges (always happen)
 graph.set_entry_point("load_ticket")
-graph.add_edge("load_ticket",      "customer_history")
+graph.add_edge("load_ticket",      "prepare_language")
+graph.add_edge("prepare_language", "customer_history")
 graph.add_edge("customer_history", "order_details")
 graph.add_edge("order_details",    "check_incident")
 
@@ -1213,6 +1557,86 @@ def run_agent1_for_ticket(
         "agent_steps": [],
     }
     return app.invoke(initial)
+
+
+def run_multilingual_agent(ticket_id: str, db_path: str = DEFAULT_DB_PATH) -> Agent1State:
+    """Backward-compatible alias — multilingual is built into Agent 1."""
+    return run_agent1_for_ticket(ticket_id, db_path)
+
+
+def run_multilingual_batch(
+    db_path:  str = DEFAULT_DB_PATH,
+    language: Optional[str] = None,
+    limit:    int = 100,
+) -> Dict[str, Any]:
+    lang_filter = "AND language != 'en'" if language is None else f"AND language = '{language}'"
+    with connect_db(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT ticket_id FROM tickets
+            WHERE language IS NOT NULL
+              {lang_filter}
+            ORDER BY urgency_score DESC, order_value DESC
+            LIMIT {limit}
+            """
+        ).fetchall()
+
+    ticket_ids = [r["ticket_id"] for r in rows]
+    results = {"processed": 0, "skipped": 0, "errors": [], "ticket_ids": ticket_ids}
+
+    for tid in ticket_ids:
+        try:
+            state = run_agent1_for_ticket(tid, db_path)
+            if state.get("error"):
+                results["errors"].append({"ticket_id": tid, "error": state["error"]})
+            else:
+                results["processed"] += 1
+        except Exception as exc:
+            results["errors"].append({"ticket_id": tid, "error": str(exc)})
+            results["skipped"] += 1
+
+    return results
+
+
+def get_language_gap_report(db_path: str = DEFAULT_DB_PATH) -> Dict[str, Any]:
+    with connect_db(db_path) as conn:
+        dist = conn.execute(
+            """
+            SELECT language,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN suggested_reply IS NOT NULL
+                             AND TRIM(suggested_reply) != '' THEN 1 ELSE 0 END) AS has_reply,
+                   ROUND(AVG(CAST(sentiment_score AS REAL)), 4) AS avg_sentiment
+            FROM tickets
+            WHERE language IS NOT NULL
+            GROUP BY language
+            ORDER BY total DESC
+            """
+        ).fetchall()
+
+        ml_log_count = 0
+        try:
+            ml_log_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM multilingual_log"
+            ).fetchone()["c"]
+        except Exception:
+            pass
+
+    rows = [row_to_dict(r) for r in dist]
+    total_non_en = sum(r["total"] for r in rows if r["language"] != "en")
+    localized = ml_log_count
+
+    return {
+        "language_distribution": rows,
+        "total_non_english_tickets": total_non_en,
+        "localized_replies_generated": localized,
+        "coverage_pct": round(localized / max(total_non_en, 1) * 100, 1),
+        "insight": (
+            f"{total_non_en} tickets were written in non-English languages. "
+            f"{localized} have received localized replies via Agent 1 "
+            f"({round(localized / max(total_non_en, 1) * 100, 1)}% coverage)."
+        ),
+    }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
