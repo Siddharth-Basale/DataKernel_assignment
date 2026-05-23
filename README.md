@@ -17,6 +17,21 @@ This project implements a local AI-powered customer support platform for the ass
 - OpenAPI/Swagger documentation with detailed schemas and examples.
 - A React dashboard in `frontend/` (Vite + TypeScript + Tailwind).
 
+## CI/CD (GitHub Actions)
+
+| Workflow | When | What it does |
+|----------|------|----------------|
+| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | Every push/PR to `main` | Builds Docker image, compiles frontend, Python syntax check |
+| [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) | After CI passes on `main` | POSTs to Render deploy hook |
+
+**Render deploy hook (one-time):**
+
+1. Render dashboard → your **Web Service** → **Settings** → **Deploy Hook** → copy URL  
+2. GitHub repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**  
+3. Name: `RENDER_DEPLOY_HOOK_URL`, value: paste the hook URL  
+
+Push to `main` → CI runs → CD triggers a new Render deploy.
+
 ## Quick start (backend + frontend)
 
 ### Backend

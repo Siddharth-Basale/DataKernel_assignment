@@ -1,0 +1,17 @@
+.env
+.venv
+venv
+__pycache__
+*.pyc
+.git
+.github
+frontend
+node_modules
+*.md
+.gitignore
+docker-compose.yml
+support.db
+chroma_store
+weekly_reports
+agent*.png
+.cursor
